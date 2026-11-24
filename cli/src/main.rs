@@ -16,7 +16,7 @@ use uvision_core::{server};
 #[command(
     name = "uvcli",
     version,
-    about = "uVision Fast CLI — Fast Keil ARM Cortex-M3 / STM32F1 build, simulator, hardware SWD & JSON-RPC server"
+    about = "uVision Fast CLI - Fast Keil ARM Cortex-M3 / STM32F1 build, simulator, hardware SWD & JSON-RPC server"
 )]
 struct Cli {
     #[arg(long, global = true, help = "Override Keil MDK installation directory")]

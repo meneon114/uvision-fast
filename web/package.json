@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "uVision Fast — Standalone Offline WebAssembly PWA for Keil uVision 5 ARM Cortex-M3 / STM32F1 Simulator",
+  "description": "uVision Fast - Standalone Offline WebAssembly PWA for Keil uVision 5 ARM Cortex-M3 / STM32F1 Simulator",
   "scripts": {
     "build:wasm": "node scripts/build-wasm.mjs",
     "gen:icons": "node scripts/gen-icons.mjs",

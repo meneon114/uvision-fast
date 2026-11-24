@@ -1,5 +1,5 @@
 {
-  "name": "uVision Fast — Keil µVision 5 ARM Simulator",
+  "name": "uVision Fast - Keil µVision 5 ARM Simulator",
   "short_name": "uVision Fast",
   "description": "Fast offline ARM Cortex-M3 / STM32F1 Keil µVision 5 IDE, assembler, simulator, and WebSerial flasher powered by WebAssembly.",
   "start_url": "./",

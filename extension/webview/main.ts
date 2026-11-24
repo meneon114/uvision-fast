@@ -1188,7 +1188,7 @@ class UvisionApp {
     for (const ex of this.watchExprs) {
       const v = this.watchVals[ex];
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escHtml(ex)}</td><td>${escHtml(v?.value_hex || '—')}</td><td>${escHtml(v?.value_dec || '')}</td><td>${escHtml(v?.kind || '')}</td>`;
+      tr.innerHTML = `<td>${escHtml(ex)}</td><td>${escHtml(v?.value_hex || '-')}</td><td>${escHtml(v?.value_dec || '')}</td><td>${escHtml(v?.kind || '')}</td>`;
       const tdDel = document.createElement('td');
       const btn = document.createElement('button');
       btn.className = 'uv-mini-btn';
@@ -1975,7 +1975,7 @@ class UvisionApp {
       } else if (tab === 'asm') {
         body.innerHTML = `
           <div class="uv-form-row"><label>Assembler Syntax:</label><select id="opt-asm">
-            <option value="armasm" ${o.asm_syntax === 'armasm' ? 'selected' : ''}>armasm (Arm Syntax — AREA/DCD/THUMB)</option>
+            <option value="armasm" ${o.asm_syntax === 'armasm' ? 'selected' : ''}>armasm (Arm Syntax: AREA/DCD/THUMB)</option>
             <option value="gnuarmclang" ${o.asm_syntax === 'gnuarmclang' ? 'selected' : ''}>armclang (GNU Syntax)</option>
           </select></div>
           <div class="uv-form-row"><label>Misc Controls:</label><input id="opt-amisc" value="${escHtml(o.a_misc)}" /></div>
@@ -2062,7 +2062,7 @@ class UvisionApp {
   private showHelpModal(): void {
     const host = document.getElementById('uv-modal-host')!;
     host.innerHTML = `<div class="uv-modal-backdrop"><div class="uv-modal">
-      <div class="uv-modal-head"><span>uVision Fast — Keyboard Shortcuts &amp; CLI</span><button class="uv-mini-btn" id="uv-m-x">×</button></div>
+      <div class="uv-modal-head"><span>uVision Fast - Keyboard Shortcuts &amp; CLI</span><button class="uv-mini-btn" id="uv-m-x">×</button></div>
       <div class="uv-modal-body" style="font-size:11.5px;line-height:1.5;">
         <b>IDE Shortcuts:</b><br/>
         • <b>F7</b>: Build Target &nbsp; • <b>Ctrl+F5</b>: Start/Stop Debug Session<br/>

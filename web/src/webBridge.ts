@@ -513,7 +513,7 @@ export class WebIdeHostBridge {
         <div class="uv-modal-head"><span>Flash / Download to STM32 (${esc(hwTarget)})</span><button class="uv-mini-btn" id="fl-x">×</button></div>
         <div class="uv-modal-body">
           <div style="font-size:11.5px;line-height:1.45;">
-            <b>Option 1 — WebSerial STM32 UART Bootloader (AN3155):</b><br/>
+            <b>Option 1: WebSerial STM32 UART Bootloader (AN3155):</b><br/>
             Connect a USB-UART adapter to <b>USART1 (TX→PA10, RX→PA9)</b>, set <b>BOOT0 = 1</b>, press <b>RESET</b>, then click Flash below.<br/>
             <span style="color:#555;">(${binBytes.length} bytes → Flash 0x08000000 • ${serialOk ? 'WebSerial ready in this browser' : 'Use Chrome/Edge over HTTPS or localhost for WebSerial'})</span>
           </div>

@@ -1,11 +1,11 @@
-# uVision Fast — Keil µVision 5 IDE (WebAssembly PWA, VS Code Extension & Rust CLI)
+# uVision Fast - Keil µVision 5 IDE (WebAssembly PWA, VS Code Extension & Rust CLI)
 
-A high-speed, zero-lag recreation of **Keil µVision 5** for **ARM Cortex-M3 / STM32F1** assembly & firmware development — available as:
+A high-speed, zero-lag recreation of **Keil µVision 5** for **ARM Cortex-M3 / STM32F1** assembly & firmware development, available as:
 
-1. **Standalone Offline WebAssembly PWA** — Runs directly in your browser and installs offline:
+1. **Standalone Offline WebAssembly PWA** - Runs directly in your browser and installs offline:
    - **Live URL**: [https://meneon114.github.io/uvision-fast/](https://meneon114.github.io/uvision-fast/)
-2. **Self-Contained VS Code Extension (`.vsix`)** — Classic Keil µVision 5 Light UI inside VS Code, bundling the native `uvcli.exe` engine and portable OpenOCD (download from [GitHub Releases](https://github.com/meneon114/uvision-fast/releases)).
-3. **Native Rust CLI (`uvcli`)** — Build, simulate, interactive debug (`uvcli debug`), and flash real STM32 boards (`uvcli flash`).
+2. **Self-Contained VS Code Extension (`.vsix`)** - Classic Keil µVision 5 Light UI inside VS Code, bundling the native `uvcli.exe` engine and portable OpenOCD (download from [GitHub Releases](https://github.com/meneon114/uvision-fast/releases)).
+3. **Native Rust CLI (`uvcli`)** - Build, simulate, interactive debug (`uvcli debug`), and flash real STM32 boards (`uvcli flash`).
 
 ---
 

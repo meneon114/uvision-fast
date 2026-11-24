@@ -25,7 +25,7 @@ export class UvisionIdePanel {
 
     const panel = vscode.window.createWebviewPanel(
       'uvisionFast.ide',
-      'Keil µVision 5 — uVision Fast',
+      'Keil µVision 5 - uVision Fast',
       vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -255,7 +255,7 @@ export class UvisionIdePanel {
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource}; img-src ${webview.cspSource} data:; font-src ${webview.cspSource};" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Keil µVision 5 — uVision Fast</title>
+  <title>Keil µVision 5 - uVision Fast</title>
   <link rel="stylesheet" href="${cssUri}" />
 </head>
 <body>

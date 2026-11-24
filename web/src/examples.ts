@@ -57,7 +57,7 @@ const STARTER_UVPROJX = `<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
 </Project>
 `;
 
-const STARTER_MAIN_S = `;;; Starter Lab — ARM Cortex-M3 Sum & SRAM Store (CSE 3108)
+const STARTER_MAIN_S = `;;; Starter Lab - ARM Cortex-M3 Sum & SRAM Store (CSE 3108)
     PRESERVE8
     THUMB
 
@@ -240,7 +240,7 @@ STOP
 export const STARTER_EXAMPLES: ExampleSpec[] = [
   {
     id: 'starter_lab',
-    title: 'Starter Lab — Cortex-M3 Sum & SRAM (.uvprojx)',
+    title: 'Starter Lab - Cortex-M3 Sum & SRAM (.uvprojx)',
     description: 'Full Keil .uvprojx project summing 1..10 and writing partial sums into SRAM 0x20000000.',
     entryPath: '/Starter_Lab/Starter_Lab.uvprojx',
     files: {
