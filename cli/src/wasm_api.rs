@@ -340,7 +340,7 @@ impl WasmState {
                     .get("device")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("STM32F100RB");
+                    .unwrap_or("STM32F103C8");
                 let template = params
                     .get("template")
                     .and_then(|v| v.as_str())
@@ -445,7 +445,8 @@ impl WasmState {
                     .map(|x| x as u32)
                     .or_else(|| self.project.as_ref().map(|p| p.options.xtal_hz))
                     .unwrap_or(8_000_000);
-                let mut sim = Simulator::new(elf.clone(), clk);
+                let device = self.project.as_ref().map(|p| p.options.device.clone()).unwrap_or_else(|| "STM32F103C8".into());
+                let mut sim = Simulator::new_for_device(elf.clone(), clk, &device);
 
                 if let Some(bps) = params.get("breakpoints").and_then(|v| v.as_array()) {
                     for bp in bps {
@@ -643,6 +644,15 @@ impl WasmState {
                 let pin = params.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let high = params.get("high").and_then(|v| v.as_bool()).unwrap_or(false);
                 self.req_sim()?.set_gpio_pin(&port, pin, high)?;
+                let snap = self.req_sim()?.peripherals()?;
+                Ok(serde_json::to_value(snap)?)
+            }
+
+            "debug.connectPins" => {
+                let a = req_str(&params, "a")?;
+                let b = req_str(&params, "b")?;
+                let connected = params.get("connected").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.req_sim()?.connect_pins(&a, &b, connected)?;
                 let snap = self.req_sim()?.peripherals()?;
                 Ok(serde_json::to_value(snap)?)
             }

@@ -44,7 +44,7 @@ enum Commands {
         dir: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = "STM32F100RB")]
+        #[arg(long, default_value = "STM32F103C8")]
         device: String,
         #[arg(long, default_value = "asm")]
         template: String,
@@ -187,7 +187,7 @@ fn main() -> Result<()> {
         } => {
             let axf = resolve_or_build_axf(&path, &tc, tc_mode, no_build)?;
             let elf = LoadedElf::load(&axf, &tc)?;
-            let mut sim = Simulator::new(elf, clock_hz);
+            let mut sim = Simulator::new_for_device(elf, clock_hz, &device_for(&path));
             let st = sim.run(max_steps, true)?;
             let mem = if let Some(addr_s) = dump_addr {
                 let addr = sim::parse_num_u32(&addr_s).ok_or_else(|| anyhow!("Invalid dump address"))?;
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
                 let mut hw_tgt = HardwareTarget::connect(&tc, elf.clone(), &interface, &target, !no_program)?;
                 run_repl(&mut hw_tgt, &elf)?;
             } else {
-                let mut sim = Simulator::new(elf.clone(), 8_000_000);
+                let mut sim = Simulator::new_for_device(elf.clone(), 8_000_000, &device_for(&path));
                 run_repl(&mut sim, &elf)?;
             }
         }
@@ -289,6 +289,11 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Device named by the project at `path` (the Blue Pill's STM32F103C8 for a bare .axf/.elf).
+fn device_for(path: &Path) -> String {
+    UvProject::open(path).map(|p| p.options.device).unwrap_or_else(|_| "STM32F103C8".into())
 }
 
 fn resolve_or_build_axf(path: &Path, tc: &ToolchainInfo, tc_mode: ToolchainMode, no_build: bool) -> Result<PathBuf> {
