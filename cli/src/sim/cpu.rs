@@ -63,8 +63,8 @@ pub struct Cpu {
     excl: Option<u32>,
     /// Asleep in WFE (an event wakes it), as opposed to WFI or sleep-on-exit.
     wfe_sleep: bool,
-    /// Pending exceptions last seen while SCR.SEVONPEND is set.
-    sev_seen: Option<Vec<bool>>,
+    /// Pending exceptions as of the previous step (for SCR.SEVONPEND).
+    sev_seen: Vec<bool>,
     cur_pc: u32,
     /// Extra cycles (exception return / tail-chain) charged to the current step.
     extra: u32,
@@ -92,7 +92,7 @@ impl Default for Cpu {
             last_fault: None,
             excl: None,
             wfe_sleep: false,
-            sev_seen: None,
+            sev_seen: Vec::new(),
             cur_pc: 0,
             extra: 0,
         }
@@ -380,19 +380,14 @@ impl Cpu {
         }
         // SEVONPEND: an exception becoming pending, even a disabled or masked one, sets the
         // event register (B1.5.18), whether or not the core is asleep yet
+        // (tracked all the time, so a transition during the store that sets SEVONPEND counts)
         let nvic = &mem.peripherals.nvic;
-        if nvic.scr & (1 << 4) != 0 {
-            match &mut self.sev_seen {
-                Some(seen) => {
-                    if nvic.pending.iter().zip(seen.iter()).any(|(&p, &s)| p && !s) {
-                        self.event_reg = true;
-                    }
-                    seen.clone_from(&nvic.pending);
-                }
-                None => self.sev_seen = Some(nvic.pending.clone()),
+        if nvic.pending != self.sev_seen {
+            let newly = nvic.pending.iter().zip(self.sev_seen.iter()).any(|(&p, &s)| p && !s);
+            if newly && nvic.scr & (1 << 4) != 0 {
+                self.event_reg = true;
             }
-        } else {
-            self.sev_seen = None;
+            self.sev_seen.clone_from(&nvic.pending);
         }
         if self.sleeping && self.wfe_sleep && self.event_reg {
             self.event_reg = false;
@@ -1118,7 +1113,8 @@ impl Cpu {
         nvic.pending[exc] = false;
         mem.peripherals.ipsr = exc as u32;
         self.excl = None;
-        self.event_reg = true;
+        // Exception entry/return would also set the event register on later cores, but not on
+        // the STM32F1's Cortex-M3 r1p1 (Arm erratum 563915, ST ES096 2.1.2).
         self.sleeping = false;
         self.wfe_sleep = false;
         match vec {

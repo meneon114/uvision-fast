@@ -285,7 +285,14 @@ impl DebugTarget for Simulator {
         // LR may hold EXC_RETURN, or a stale return address once a BL has come back. A nested
         // handler that preempts this one does not count as returning.
         let handler = self.mem.peripherals.ipsr as usize;
-        let exc_return = handler != 0 && self.cpu.r[14] >= 0xFFFF_FFF0;
+        // LR is stale when it holds EXC_RETURN or when the PC is in the handler's own body
+        // (the PROC its vector points at): only the exception return ends the step then.
+        let in_handler_body = handler != 0 && {
+            let entry = self.mem.read32(self.mem.peripherals.vtor().wrapping_add(4 * handler as u32)) & !1;
+            let pc = self.cpu.r[15];
+            self.elf.symbols.iter().any(|s| s.is_func && s.addr == entry && pc >= entry && pc < entry + s.size.max(1))
+        };
+        let exc_return = handler != 0 && (self.cpu.r[14] >= 0xFFFF_FFF0 || in_handler_body);
         let mut reason = "StepOut".to_string();
         for _ in 0..50_000 {
             let hr = self.step_one_internal();

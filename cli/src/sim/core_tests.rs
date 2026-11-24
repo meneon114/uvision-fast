@@ -704,3 +704,74 @@ fn step_out_reports_a_fault_on_exception_return() {
     let st = sim.step_out().unwrap();
     assert!(st.halt_reason.starts_with("Fault"), "reason {}", st.halt_reason);
 }
+
+#[test]
+fn sevonpend_counts_a_transition_during_the_store_that_enables_it() {
+    let src = prog(
+        "    LDR r0, =0x4002101C
+    MOVS r1, #1
+    STR r1, [r0]                ; RCC_APB1ENR: TIM2
+    LDR r0, =0x40000000
+    MOVS r1, #3
+    STR r1, [r0, #0x2C]         ; ARR
+    MOVS r1, #1
+    STR r1, [r0, #0x0C]         ; DIER.UIE, TIM2 IRQ disabled in the NVIC
+    LDR r2, =0xE000ED10
+    MOVS r3, #0x10
+    SEV
+    WFE                         ; event register clear
+    STR r1, [r0, #0x00]         ; CEN
+    STR r3, [r2]                ; SCR.SEVONPEND
+    WFE
+    MOVS r7, #3
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 3);
+}
+
+#[test]
+fn exception_entry_and_return_do_not_set_the_event_register_on_r1p1() {
+    let src = prog("    SEV\n    WFE\n    SVC #0\n    WFE\n    MOVS r7, #4\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC\n    BX lr\n    ENDP\n    END\n",
+    );
+    let mut sim = boot(&src);
+    for _ in 0..2_000 {
+        sim.cpu.step(&mut sim.mem);
+    }
+    assert!(sim.cpu.sleeping, "WFE after an SVC round trip sleeps (Arm erratum 563915)");
+    assert_ne!(sim.cpu.r[7], 4);
+}
+
+#[test]
+fn step_out_of_a_handler_that_calls_a_helper_in_a_loop() {
+    use crate::target::DebugTarget;
+    let src = prog("    SVC #0\nback\n    MOVS r7, #5\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    PUSH {r4, lr}
+    MOVS r4, #3
+again
+    BL helper
+after_bl
+    SUBS r4, r4, #1
+    BNE again
+    POP {r4, pc}
+    ENDP
+helper PROC
+    BX lr
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    let after_bl = sim.elf.symbol_addr("after_bl").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == after_bl).expect("after the first helper call");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.mem.peripherals.ipsr, 0, "left the handler, not the next loop iteration");
+    assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("back").unwrap());
+}
