@@ -1,0 +1,162 @@
+/* Design tokens, plain custom properties so the canvas logic analyzer can read them too.
+   `data-theme` on <html> picks light or dark; in the VS Code webview the root route sets it
+   from the editor's theme class on <body>. index.css exposes them to Tailwind with @theme. */
+
+:root {
+  --dbgstatus: #b84c12;
+  --ondbg: #ffffff;
+  --asm: #d18616;
+  --overlay: rgb(0 0 0 / 0.32);
+  --led-red: #e5484d;
+  --led-yellow: #e8b600;
+  --led-green: #2ea043;
+  --led-blue: #3b82f6;
+}
+
+:root,
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --chrome: #f8f8f8;
+  --chrome2: #f3f3f3;
+  --border: #e5e5e5;
+  --border2: #d4d4d4;
+  --fg: #1f1f1f;
+  --fg2: #3b3b3b;
+  --muted: #6e6e6e;
+  --hover: #e8e8e8;
+  --press: #dcdcdc;
+  --sel: #e4effb;
+  --selbar: #005fb8;
+  --acc: #005fb8;
+  --accfg: #ffffff;
+  --acc-hover: #0258a8;
+  --pc: #fff6bf;
+  --pcline: #e8c600;
+  --cur: #f5f5f5;
+  --chg: #0040ff;
+  --bp: #e51400;
+  --go: #2d7a2d;
+  --stop: #c72e0f;
+  --cov: #4aa35a;
+  --warn: #9a6700;
+  --t-k: #0000ff;
+  --t-d: #af5f00;
+  --t-r: #267f99;
+  --t-n: #098658;
+  --t-c: #008000;
+  --t-l: #795e26;
+  --t-s: #a31515;
+  --t-a: #6e6e6e;
+  --t-o: #8a8a8a;
+  --status: #f8f8f8;
+  --statusfg: #3b3b3b;
+  --shadow: 0 8px 28px rgb(0 0 0 / 0.16), 0 1px 3px rgb(0 0 0 / 0.1);
+  --cmdc: #f3f3f3;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --bg: #1f1f1f;
+    --chrome: #181818;
+    --chrome2: #1f1f1f;
+    --border: #2b2b2b;
+    --border2: #3c3c3c;
+    --fg: #e0e0e0;
+    --fg2: #cccccc;
+    --muted: #9d9d9d;
+    --hover: #2a2d2e;
+    --press: #333638;
+    --sel: #04395e;
+    --selbar: #0078d4;
+    --acc: #0078d4;
+    --accfg: #ffffff;
+    --acc-hover: #1f8ad8;
+    --pc: #4b4413;
+    --pcline: #ffcc00;
+    --cur: #262626;
+    --chg: #4fc1ff;
+    --bp: #f14c4c;
+    --go: #89d185;
+    --stop: #f48771;
+    --cov: #3f8f4f;
+    --warn: #cca700;
+    --t-k: #569cd6;
+    --t-d: #d7ba7d;
+    --t-r: #4ec9b0;
+    --t-n: #b5cea8;
+    --t-c: #6a9955;
+    --t-l: #dcdcaa;
+    --t-s: #ce9178;
+    --t-a: #858585;
+    --t-o: #6e7681;
+    --status: #181818;
+    --statusfg: #cccccc;
+    --shadow: 0 8px 28px rgb(0 0 0 / 0.55), 0 0 0 1px #3c3c3c;
+    --cmdc: #222222;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #1f1f1f;
+  --chrome: #181818;
+  --chrome2: #1f1f1f;
+  --border: #2b2b2b;
+  --border2: #3c3c3c;
+  --fg: #e0e0e0;
+  --fg2: #cccccc;
+  --muted: #9d9d9d;
+  --hover: #2a2d2e;
+  --press: #333638;
+  --sel: #04395e;
+  --selbar: #0078d4;
+  --acc: #0078d4;
+  --accfg: #ffffff;
+  --acc-hover: #1f8ad8;
+  --pc: #4b4413;
+  --pcline: #ffcc00;
+  --cur: #262626;
+  --chg: #4fc1ff;
+  --bp: #f14c4c;
+  --go: #89d185;
+  --stop: #f48771;
+  --cov: #3f8f4f;
+  --warn: #cca700;
+  --t-k: #569cd6;
+  --t-d: #d7ba7d;
+  --t-r: #4ec9b0;
+  --t-n: #b5cea8;
+  --t-c: #6a9955;
+  --t-l: #dcdcaa;
+  --t-s: #ce9178;
+  --t-a: #858585;
+  --t-o: #6e7681;
+  --status: #181818;
+  --statusfg: #cccccc;
+  --shadow: 0 8px 28px rgb(0 0 0 / 0.55), 0 0 0 1px #3c3c3c;
+  --cmdc: #222222;
+}
+
+/* ui-sdk reads these. */
+:root {
+  --ui-background: var(--bg);
+  --ui-foreground: var(--fg);
+  --ui-muted: var(--chrome2);
+  --ui-muted-foreground: var(--muted);
+  --ui-border: var(--border);
+  --ui-input: var(--border2);
+  --ui-primary: var(--acc);
+  --ui-primary-foreground: var(--accfg);
+  --ui-destructive: var(--bp);
+  --ui-ring: color-mix(in srgb, var(--acc) 40%, transparent);
+  --ui-ring-border: var(--acc);
+  --ui-overlay: var(--overlay);
+  --ui-shadow: var(--shadow);
+  --ui-radius: var(--radius-sm);
+  --ui-spacing: 4px;
+  --ui-font-size: 13px;
+  --ui-font-sans: var(--font-ui);
+  --ui-font-mono: var(--font-mono);
+}

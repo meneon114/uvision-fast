@@ -1,0 +1,146 @@
+@layer ui-sdk;
+@import "tailwindcss";
+@import "@ui-sdk/core/web.css" layer(components);
+@import "@vscode/codicons/dist/codicon.css" layer(components);
+@import "./tokens.css";
+@import "./plain.css";
+
+/* Components use these as utilities: bg-chrome, text-muted, border-border2, rounded-sm, text-ui, ease-snap. */
+@theme inline {
+  --color-*: initial;
+  --color-bg: var(--bg);
+  --color-chrome: var(--chrome);
+  --color-chrome2: var(--chrome2);
+  --color-border: var(--border);
+  --color-border2: var(--border2);
+  --color-fg: var(--fg);
+  --color-fg2: var(--fg2);
+  --color-muted: var(--muted);
+  --color-hover: var(--hover);
+  --color-press: var(--press);
+  --color-sel: var(--sel);
+  --color-selbar: var(--selbar);
+  --color-acc: var(--acc);
+  --color-accfg: var(--accfg);
+  --color-acc-hover: var(--acc-hover);
+  --color-pc: var(--pc);
+  --color-pcline: var(--pcline);
+  --color-cur: var(--cur);
+  --color-chg: var(--chg);
+  --color-bp: var(--bp);
+  --color-go: var(--go);
+  --color-stop: var(--stop);
+  --color-cov: var(--cov);
+  --color-warn: var(--warn);
+  --color-status: var(--status);
+  --color-statusfg: var(--statusfg);
+  --color-dbgstatus: var(--dbgstatus);
+  --color-ondbg: var(--ondbg);
+  --color-cmdc: var(--cmdc);
+  --color-asm: var(--asm);
+  --color-overlay: var(--overlay);
+  --color-t-k: var(--t-k);
+  --color-t-d: var(--t-d);
+  --color-t-r: var(--t-r);
+  --color-t-n: var(--t-n);
+  --color-t-c: var(--t-c);
+  --color-t-l: var(--t-l);
+  --color-t-s: var(--t-s);
+  --color-t-a: var(--t-a);
+  --color-t-o: var(--t-o);
+  --color-led-red: var(--led-red);
+  --color-led-yellow: var(--led-yellow);
+  --color-led-green: var(--led-green);
+  --color-led-blue: var(--led-blue);
+
+  --shadow-*: initial;
+  --shadow-pop: var(--shadow);
+}
+
+@theme static {
+  --font-*: initial;
+  --font-ui: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, Inter, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, 'SF Mono', monospace;
+
+  /* Font sizes only; line height inherits. */
+  --text-*: initial;
+  --text-3xs: 10px;
+  --text-2xs: 11px;
+  --text-xs: 11.5px;
+  --text-sm: 12px;
+  --text-ui: 12.5px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 16px;
+  --text-2xl: 20px;
+  --text-3xl: 24px;
+  --text-4xl: 28px;
+  --text-5xl: 32px;
+
+  /* The sharp radius scale. */
+  --radius-*: initial;
+  --radius-xs: 3px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+
+  --ease-*: initial;
+  --ease-snap: cubic-bezier(0.2, 0, 0, 1);
+
+  --breakpoint-*: initial;
+}
+
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
+@custom-variant narrow (@media (max-width: 1180px));
+@custom-variant compact (@media (max-width: 900px));
+@custom-variant phone (@media (max-width: 720px));
+
+@utility no-scrollbar {
+  scrollbar-width: none;
+}
+
+/* Directly in `components`, so these beat web.css (a sublayer of it) as the old unlayered sheet did,
+   and utilities still beat these. */
+@layer components {
+  html,
+  body,
+  #app {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--chrome);
+    color: var(--fg2);
+    font: 13px/1.4 var(--font-ui);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--acc);
+    outline-offset: -1px;
+  }
+
+  code,
+  kbd,
+  pre {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+  }
+
+  kbd {
+    font: 11px var(--font-ui);
+    color: var(--muted);
+    border: 1px solid var(--border2);
+    border-bottom-width: 2px;
+    border-radius: var(--radius-xs);
+    padding: 0 5px;
+    background: var(--chrome);
+  }
+
+  .codicon {
+    font-size: 16px;
+    vertical-align: -3px;
+  }
+}

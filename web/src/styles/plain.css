@@ -1,0 +1,105 @@
+/* The only plain CSS left: what utilities can't reach.
+   Unlayered on purpose. CodeMirror injects its base theme unlayered at runtime, and any
+   layered rule would lose to it, so these overrides must stay unlayered too. */
+
+/* CodeMirror's internal DOM. The editor host itself is styled with utilities in CodeEditor.tsx. */
+.cm-host .cm-editor {
+  flex: 1;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg2);
+  font-size: 12.5px;
+}
+
+.cm-host .cm-editor.cm-focused {
+  outline: none;
+}
+
+.cm-host .cm-scroller {
+  font-family: var(--font-mono);
+  line-height: 19px;
+}
+
+.cm-host .cm-content {
+  caret-color: var(--fg);
+  padding: 4px 0;
+}
+
+.cm-host .cm-cursor {
+  border-left-color: var(--fg);
+}
+
+.cm-host .cm-gutters {
+  background: var(--bg);
+  border: 0;
+  color: var(--t-a);
+}
+
+.cm-host .cm-lineNumbers .cm-gutterElement {
+  min-width: 34px;
+  padding: 0 14px 0 4px;
+}
+
+.cm-host .cm-activeLine {
+  background: var(--cur);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.cm-host .cm-activeLineGutter {
+  background: transparent;
+  color: var(--fg);
+}
+
+.cm-host .cm-selectionBackground,
+.cm-host .cm-focused .cm-selectionBackground,
+.cm-host .cm-content ::selection {
+  background: color-mix(in srgb, var(--acc) 22%, transparent) !important;
+}
+
+.cm-host .cm-selectionMatch {
+  background: color-mix(in srgb, var(--acc) 12%, transparent);
+}
+
+/* The PC line decoration has to beat .cm-activeLine. */
+.cm-host .uv-pc-line {
+  background: var(--pc) !important;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--pcline) 60%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--pcline) 60%, transparent);
+}
+
+.cm-host .cm-panels {
+  background: var(--chrome);
+  color: var(--fg2);
+  border-color: var(--border);
+}
+
+.cm-host .cm-panel.cm-search input,
+.cm-host .cm-panel.cm-search button {
+  font: 12px var(--font-ui);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  background-image: none;
+  padding: 2px 6px;
+}
+
+.cm-host .cm-searchMatch {
+  background: color-mix(in srgb, var(--pcline) 35%, transparent);
+}
+
+/* Reduced motion, for every animation, transition and press nudge at once. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  :active {
+    translate: none !important;
+  }
+}
