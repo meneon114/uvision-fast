@@ -21,7 +21,7 @@ const CATEGORIES = [...new Set(COMMANDS.map((c) => c.category))];
 
 export function PaletteDialog() {
   return (
-    <Modal name="palette" title="Command Palette" size="md">
+    <Modal name="palette" title="Command Palette" size="md" initialFocus="#palette-input">
       <Command
         className="flex flex-col min-h-0"
         onAction={(id) => {
@@ -36,7 +36,7 @@ export function PaletteDialog() {
             className="flex-1 h-full border-0 outline-none bg-transparent text-fg text-base"
             aria-label="Search commands"
             placeholder="Type a command: build, step, memory, theme..."
-            autoFocus
+            id="palette-input"
           />
         </div>
         <CommandEmpty className={EMPTY}>No matching commands.</CommandEmpty>

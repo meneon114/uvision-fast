@@ -23,6 +23,7 @@ export function Modal({
   children,
   footer,
   onClose,
+  initialFocus,
 }: {
   name: DialogName;
   title: string;
@@ -31,6 +32,8 @@ export function Modal({
   children?: ReactNode;
   footer?: ReactNode;
   onClose?: () => void;
+  /** Selector for the element focused on open. Without it ui-sdk focuses the first tabbable, the Close button. */
+  initialFocus?: string;
 }) {
   const open = useIde((s) => s.dialog === name);
   return (
@@ -45,6 +48,7 @@ export function Modal({
     >
       <DialogBackdrop className="bg-overlay" />
       <DialogContent
+        initialFocus={initialFocus}
         className={cx(
           'max-h-[calc(100dvh-64px)] flex flex-col gap-0 p-0 border border-border2 rounded-md bg-bg text-fg2 shadow-pop overflow-hidden',
           WIDTH[size],
