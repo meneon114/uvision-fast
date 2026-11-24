@@ -2,6 +2,10 @@ export interface IdeBridge {
   isWeb: boolean;
   postMessage(msg: any): void;
   onMessage(handler: (msg: any) => void): void;
+  getSessionState?(): any;
+  setSessionState?(state: any): void;
+  saveDraftSync?(path: string, content: string): void;
+  clearDraftSync?(path: string): void;
 }
 
 declare function acquireVsCodeApi(): {
@@ -20,6 +24,8 @@ export function getIdeBridge(): IdeBridge {
       onMessage: (handler: (msg: any) => void) => {
         window.addEventListener('message', (ev) => handler(ev.data));
       },
+      getSessionState: () => vscode.getState(),
+      setSessionState: (state: any) => vscode.setState(state),
     };
   }
   if (g.__UVISION_WEB_BRIDGE__) {

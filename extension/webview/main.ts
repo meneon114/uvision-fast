@@ -118,11 +118,28 @@ interface OpenDoc {
   isC: boolean;
 }
 
+interface PersistedSession {
+  projectPath: string | null;
+  openDocPaths: string[];
+  activeDocPath: string | null;
+  breakpoints: Record<string, number[]>;
+  watchExprs: string[];
+  memAddrs: string[];
+  leftWidth: number;
+  bottomHeight: number;
+  disasmHeight: number;
+  showDisasm: boolean;
+  activePeriphTab: string;
+  bottomTab: string;
+}
+
 class UvisionApp {
   private readonly bridge: IdeBridge = getIdeBridge();
   private reqSeq = 1;
   private pwaCanInstall = false;
   private pwaOfflineReady = false;
+  private autoSaveTimer: number | null = null;
+  private isRestoringSession = false;
   private rpcPending = new Map<number, { res: (v: any) => void; rej: (e: any) => void }>();
   private hostPending = new Map<number, { res: (v: any) => void; rej: (e: any) => void }>();
 
@@ -174,10 +191,102 @@ class UvisionApp {
   private rootEl!: HTMLElement;
 
   constructor() {
+    this.loadInitialUiPrefs();
     this.setupBridge();
     this.mountShell();
     this.setupKeyboardShortcuts();
+    this.setupUnloadPersistence();
     this.bridge.postMessage({ type: 'ready' });
+  }
+
+  private loadInitialUiPrefs(): void {
+    try {
+      const s = this.bridge.getSessionState?.() as Partial<PersistedSession> | null | undefined;
+      if (!s || typeof s !== 'object') return;
+      if (typeof s.leftWidth === 'number' && s.leftWidth >= 150 && s.leftWidth <= 520) {
+        this.leftWidth = s.leftWidth;
+      }
+      if (typeof s.bottomHeight === 'number' && s.bottomHeight >= 90 && s.bottomHeight <= 520) {
+        this.bottomHeight = s.bottomHeight;
+      }
+      if (typeof s.disasmHeight === 'number' && s.disasmHeight >= 70 && s.disasmHeight <= 420) {
+        this.disasmHeight = s.disasmHeight;
+      }
+      if (typeof s.showDisasm === 'boolean') this.showDisasm = s.showDisasm;
+      if (typeof s.activePeriphTab === 'string' && s.activePeriphTab) {
+        this.activePeriphTab = s.activePeriphTab;
+      }
+      if (typeof s.bottomTab === 'string' && s.bottomTab) {
+        this.bottomTab = s.bottomTab;
+      }
+      if (Array.isArray(s.watchExprs) && s.watchExprs.length > 0) {
+        this.watchExprs = s.watchExprs.filter((x) => typeof x === 'string' && x.trim().length > 0);
+      }
+      if (Array.isArray(s.memAddrs) && s.memAddrs.length === 4) {
+        this.memAddrs = s.memAddrs.map((x) => String(x || '0x20000000'));
+      }
+      if (s.breakpoints && typeof s.breakpoints === 'object') {
+        this.savedLineBreakpoints.clear();
+        for (const [k, lines] of Object.entries(s.breakpoints)) {
+          if (Array.isArray(lines) && lines.length > 0) {
+            this.savedLineBreakpoints.set(normPath(k), new Set(lines.map((n) => Number(n)).filter((n) => n > 0)));
+          }
+        }
+      }
+    } catch {
+      // ignore corrupted session prefs
+    }
+  }
+
+  private persistSession(): void {
+    if (this.isRestoringSession || !this.bridge.setSessionState) return;
+    const bps: Record<string, number[]> = {};
+    this.savedLineBreakpoints.forEach((lines, file) => {
+      if (lines.size > 0) {
+        bps[file] = Array.from(lines).sort((a, b) => a - b);
+      }
+    });
+    const session: PersistedSession = {
+      projectPath: this.project?.project_file || this.activeDocPath || null,
+      openDocPaths: this.openDocs.map((d) => d.path),
+      activeDocPath: this.activeDocPath,
+      breakpoints: bps,
+      watchExprs: [...this.watchExprs],
+      memAddrs: [...this.memAddrs],
+      leftWidth: this.leftWidth,
+      bottomHeight: this.bottomHeight,
+      disasmHeight: this.disasmHeight,
+      showDisasm: this.showDisasm,
+      activePeriphTab: this.activePeriphTab,
+      bottomTab: this.bottomTab,
+    };
+    this.bridge.setSessionState(session);
+  }
+
+  private flushPendingDraftsSync(): void {
+    for (const doc of this.openDocs) {
+      if (doc.dirty) {
+        this.bridge.saveDraftSync?.(doc.path, doc.content);
+      }
+    }
+    this.persistSession();
+  }
+
+  private setupUnloadPersistence(): void {
+    window.addEventListener('beforeunload', () => {
+      this.flushPendingDraftsSync();
+    });
+    window.addEventListener('pagehide', () => {
+      this.flushPendingDraftsSync();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        this.flushPendingDraftsSync();
+        if (this.bridge.isWeb) {
+          void this.saveAllDocs(true);
+        }
+      }
+    });
   }
 
   private setupBridge(): void {
@@ -197,6 +306,8 @@ class UvisionApp {
           if (msg.error) p.rej(new Error(msg.error));
           else p.res(msg.result);
         }
+      } else if (msg.type === 'restoreSession') {
+        void this.restoreSession(msg.session || null, msg.fallbackPath);
       } else if (msg.type === 'openTarget' && msg.path) {
         void this.openProjectOrFile(msg.path);
       } else if (msg.type === 'setPwaState') {
@@ -281,7 +392,17 @@ class UvisionApp {
         if (doc) {
           doc.content = content;
           doc.dirty = true;
+          this.bridge.saveDraftSync?.(doc.path, content);
           this.renderDocTabs();
+          if (this.bridge.isWeb) {
+            if (this.autoSaveTimer !== null) {
+              window.clearTimeout(this.autoSaveTimer);
+            }
+            this.autoSaveTimer = window.setTimeout(() => {
+              this.autoSaveTimer = null;
+              void this.saveAllDocs(true);
+            }, 350);
+          }
         }
       },
       onToggleBreakpoint: (line) => {
@@ -323,6 +444,7 @@ class UvisionApp {
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
+        this.persistSession();
       };
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
@@ -342,6 +464,7 @@ class UvisionApp {
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
+        this.persistSession();
       };
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
@@ -360,6 +483,7 @@ class UvisionApp {
       const onUp = () => {
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
+        this.persistSession();
       };
       window.addEventListener('mousemove', onMove);
       window.addEventListener('mouseup', onUp);
@@ -494,7 +618,7 @@ class UvisionApp {
         items: [
           { label: 'Project Window', fn: () => { this.leftTab = 'project'; this.renderLeftPane(); } },
           { label: 'Registers Window', fn: () => { this.leftTab = 'registers'; this.renderLeftPane(); } },
-          { label: 'Disassembly Window', fn: () => { this.showDisasm = !this.showDisasm; this.renderDisasm(); } },
+          { label: 'Disassembly Window', fn: () => { this.showDisasm = !this.showDisasm; this.renderDisasm(); this.persistSession(); } },
           { sep: true },
           { label: 'Build Output', fn: () => { this.bottomTab = 'build'; this.renderBottomPane(); } },
           { label: 'Command Window', fn: () => { this.bottomTab = 'command'; this.renderBottomPane(); } },
@@ -688,7 +812,7 @@ class UvisionApp {
       addBtn(ICONS.stepOut, 'Step Out (Ctrl+F11)', () => void this.debugAction('debug.stepOut'));
       addBtn(ICONS.runToCursor, 'Run to Cursor Line', () => void this.runToCursor());
       addSep();
-      addBtn(ICONS.disasm, 'Toggle Disassembly Window', () => { this.showDisasm = !this.showDisasm; this.renderDisasm(); }, this.showDisasm);
+      addBtn(ICONS.disasm, 'Toggle Disassembly Window', () => { this.showDisasm = !this.showDisasm; this.renderDisasm(); this.persistSession(); }, this.showDisasm);
       addBtn(ICONS.memory, 'Memory 1', () => { this.bottomTab = 'mem1'; this.renderBottomPane(); }, this.bottomTab.startsWith('mem'));
       addBtn(ICONS.watch, 'Watch 1', () => { this.bottomTab = 'watch'; this.renderBottomPane(); }, this.bottomTab === 'watch');
       addBtn(ICONS.uart, 'Serial UART #1', () => { this.bottomTab = 'uart'; this.renderBottomPane(); }, this.bottomTab === 'uart');
@@ -1012,6 +1136,7 @@ class UvisionApp {
       b.addEventListener('click', () => {
         this.bottomTab = t.id;
         this.renderBottomPane();
+        this.persistSession();
       });
       tabsEl.appendChild(b);
     }
@@ -1110,6 +1235,7 @@ class UvisionApp {
     const addrInput = document.getElementById(`uv-mem-addr-${idx}`) as HTMLInputElement;
     const triggerRead = () => {
       this.memAddrs[idx] = addrInput.value.trim() || '0x20000000';
+      this.persistSession();
       void this.refreshMemoryIdx(idx);
     };
     addrInput.addEventListener('keydown', (e) => {
@@ -1176,7 +1302,12 @@ class UvisionApp {
       if (ex && !this.watchExprs.includes(ex)) {
         this.watchExprs.push(ex);
         inp.value = '';
-        void this.refreshWatch();
+        this.persistSession();
+        if (this.mode === 'debug') {
+          void this.refreshWatch();
+        } else {
+          this.renderBottomPane();
+        }
       }
     };
     document.getElementById('uv-watch-add')!.addEventListener('click', addFn);
@@ -1195,6 +1326,7 @@ class UvisionApp {
       btn.textContent = '×';
       btn.addEventListener('click', () => {
         this.watchExprs = this.watchExprs.filter((x) => x !== ex);
+        this.persistSession();
         this.renderBottomPane();
       });
       tdDel.appendChild(btn);
@@ -1301,6 +1433,7 @@ class UvisionApp {
       div.textContent = it;
       div.addEventListener('click', () => {
         this.activePeriphTab = it;
+        this.persistSession();
         this.renderPeripheralsTab(container);
       });
       nav.appendChild(div);
@@ -1395,27 +1528,111 @@ class UvisionApp {
 
   // ---- Actions ----
 
-  private async openProjectOrFile(targetPath: string): Promise<void> {
+  private async restoreSession(session: PersistedSession | null, fallbackPath?: string): Promise<void> {
+    this.isRestoringSession = true;
     try {
+      if (session && typeof session === 'object') {
+        if (typeof session.leftWidth === 'number') {
+          this.leftWidth = session.leftWidth;
+          const lp = document.getElementById('uv-left-pane');
+          if (lp) lp.style.width = `${this.leftWidth}px`;
+        }
+        if (typeof session.bottomHeight === 'number') {
+          this.bottomHeight = session.bottomHeight;
+          const bp = document.getElementById('uv-bottom-pane');
+          if (bp) bp.style.height = `${this.bottomHeight}px`;
+        }
+        if (typeof session.disasmHeight === 'number') {
+          this.disasmHeight = session.disasmHeight;
+          const dp = document.getElementById('uv-disasm-pane');
+          if (dp) dp.style.height = `${this.disasmHeight}px`;
+        }
+        if (typeof session.showDisasm === 'boolean') this.showDisasm = session.showDisasm;
+        if (typeof session.activePeriphTab === 'string' && session.activePeriphTab) {
+          this.activePeriphTab = session.activePeriphTab;
+        }
+        if (session.bottomTab === 'build' || session.bottomTab === 'peripherals') {
+          this.bottomTab = session.bottomTab;
+        } else {
+          this.bottomTab = 'build';
+        }
+        if (Array.isArray(session.watchExprs) && session.watchExprs.length > 0) {
+          this.watchExprs = [...session.watchExprs];
+        }
+        if (Array.isArray(session.memAddrs) && session.memAddrs.length === 4) {
+          this.memAddrs = [...session.memAddrs];
+        }
+        if (session.breakpoints && typeof session.breakpoints === 'object') {
+          this.savedLineBreakpoints.clear();
+          for (const [k, lines] of Object.entries(session.breakpoints)) {
+            if (Array.isArray(lines) && lines.length > 0) {
+              this.savedLineBreakpoints.set(normPath(k), new Set(lines.map((n) => Number(n)).filter((n) => n > 0)));
+            }
+          }
+        }
+
+        const hasSavedDocs = Array.isArray(session.openDocPaths) && session.openDocPaths.length > 0;
+        let openedProj = false;
+        if (session.projectPath) {
+          openedProj = await this.openProjectOrFile(session.projectPath, hasSavedDocs);
+        }
+        if (!openedProj && fallbackPath) {
+          await this.openProjectOrFile(fallbackPath, false);
+        } else if (hasSavedDocs) {
+          for (const docPath of session.openDocPaths) {
+            try {
+              await this.openFileInEditor(docPath);
+            } catch {
+              // ignore deleted/missing doc
+            }
+          }
+          if (session.activeDocPath && this.openDocs.some((d) => normPath(d.path) === normPath(session.activeDocPath!))) {
+            this.activateDoc(session.activeDocPath);
+          } else if (this.openDocs.length > 0) {
+            this.activateDoc(this.openDocs[0].path);
+          } else if (this.project) {
+            const first = this.project.groups.flatMap((g) => g.files).find((f) => f.file_type === 1 || f.file_type === 2);
+            if (first) await this.openFileInEditor(first.abs_path);
+          }
+        }
+      } else if (fallbackPath) {
+        await this.openProjectOrFile(fallbackPath, false);
+      }
+    } finally {
+      this.isRestoringSession = false;
+      this.syncEditorDebugOverlay();
+      this.renderAll();
+      this.persistSession();
+    }
+  }
+
+  private async openProjectOrFile(targetPath: string, skipDefaultOpen = false): Promise<boolean> {
+    try {
+      await this.saveAllDocs(true);
       this.statusText = `Opening ${baseName(targetPath)}...`;
       this.renderStatusBar();
       const proj = await this.rpc<UvProject>('project.open', { path: targetPath });
       this.project = proj;
 
-      const lower = targetPath.toLowerCase();
-      if (/\.(s|asm|c|h)$/i.test(lower)) {
-        await this.openFileInEditor(targetPath);
-      } else {
-        const first = proj.groups.flatMap((g) => g.files).find((f) => f.file_type === 1 || f.file_type === 2);
-        if (first) {
-          await this.openFileInEditor(first.abs_path);
+      if (!skipDefaultOpen) {
+        const lower = targetPath.toLowerCase();
+        if (/\.(s|asm|c|h)$/i.test(lower)) {
+          await this.openFileInEditor(targetPath);
+        } else {
+          const first = proj.groups.flatMap((g) => g.files).find((f) => f.file_type === 1 || f.file_type === 2);
+          if (first) {
+            await this.openFileInEditor(first.abs_path);
+          }
         }
       }
       this.statusText = `Opened ${baseName(targetPath)}`;
       this.renderAll();
+      this.persistSession();
+      return true;
     } catch (e: any) {
       this.statusText = `Open failed: ${e.message}`;
       this.renderStatusBar();
+      return false;
     }
   }
 
@@ -1440,6 +1657,7 @@ class UvisionApp {
     };
     this.openDocs.push(doc);
     this.activateDoc(doc.path);
+    this.persistSession();
   }
 
   private activateDoc(filePath: string): void {
@@ -1450,6 +1668,7 @@ class UvisionApp {
     this.syncEditorDebugOverlay();
     this.renderDocTabs();
     this.renderLeftPane();
+    this.persistSession();
   }
 
   private closeDoc(filePath: string): void {
@@ -1461,6 +1680,7 @@ class UvisionApp {
       else this.editor.setDocument('', false);
     }
     this.renderDocTabs();
+    this.persistSession();
   }
 
   private getActiveDoc(): OpenDoc | undefined {
@@ -1473,20 +1693,34 @@ class UvisionApp {
     const doc = this.getActiveDoc();
     if (!doc) return;
     await this.host('writeFile', { path: doc.path, content: doc.content });
+    this.bridge.clearDraftSync?.(doc.path);
     doc.dirty = false;
     this.statusText = `Saved ${doc.name}`;
     this.renderDocTabs();
     this.renderStatusBar();
+    this.persistSession();
   }
 
-  private async saveAllDocs(): Promise<void> {
+  private async saveAllDocs(auto = false): Promise<void> {
+    let savedCount = 0;
+    let lastSavedName = '';
     for (const doc of this.openDocs) {
       if (doc.dirty) {
         await this.host('writeFile', { path: doc.path, content: doc.content });
+        this.bridge.clearDraftSync?.(doc.path);
         doc.dirty = false;
+        savedCount++;
+        lastSavedName = doc.name;
       }
     }
-    this.renderDocTabs();
+    if (savedCount > 0) {
+      this.renderDocTabs();
+      if (auto) {
+        this.statusText = savedCount === 1 ? `Auto-saved ${lastSavedName}` : `Auto-saved ${savedCount} files`;
+        this.renderStatusBar();
+      }
+      this.persistSession();
+    }
   }
 
   private async runBuild(rebuild: boolean): Promise<boolean> {
@@ -1681,6 +1915,7 @@ class UvisionApp {
       }
     }
     this.syncEditorDebugOverlay();
+    this.persistSession();
   }
 
   private async toggleBreakpointByAddr(addr: number): Promise<void> {
@@ -1699,6 +1934,7 @@ class UvisionApp {
       this.renderDisasm();
     }
     this.syncEditorDebugOverlay();
+    this.persistSession();
   }
 
   private async refreshMemoryIdx(idx: number, quiet = false): Promise<void> {
@@ -1843,6 +2079,7 @@ class UvisionApp {
     this.project = res.project;
     await this.openFileInEditor(p);
     this.renderLeftPane();
+    this.persistSession();
   }
 
   private async showToolchainInfo(): Promise<void> {
@@ -1898,6 +2135,7 @@ class UvisionApp {
       const first = proj.groups[0]?.files[0];
       if (first) await this.openFileInEditor(first.abs_path);
       this.renderAll();
+      this.persistSession();
     };
   }
 
@@ -1929,6 +2167,7 @@ class UvisionApp {
         close();
         await this.openFileInEditor(res.added.abs_path);
         this.renderLeftPane();
+        this.persistSession();
       }
     };
   }
@@ -2006,6 +2245,7 @@ class UvisionApp {
         host.innerHTML = '';
         this.renderToolbar();
         this.renderStatusBar();
+        this.persistSession();
       };
     };
 

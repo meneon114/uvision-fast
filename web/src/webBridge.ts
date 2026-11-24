@@ -1,5 +1,13 @@
 import { STARTER_EXAMPLES } from './examples';
-import { VirtualFsStore, decodeBase64, triggerDownload } from './vfsStore';
+import {
+  VirtualFsStore,
+  clearPendingDraftSync,
+  decodeBase64,
+  loadSessionStateSync,
+  savePendingDraftSync,
+  saveSessionStateSync,
+  triggerDownload,
+} from './vfsStore';
 import { WasmEngineClient } from './wasmClient';
 import { flashStm32ViaWebSerial, isWebSerialSupported } from './webSerialFlasher';
 
@@ -33,6 +41,18 @@ export class WebIdeHostBridge {
       },
       onMessage(handler: MsgHandler) {
         self.handlers.push(handler);
+      },
+      getSessionState() {
+        return loadSessionStateSync();
+      },
+      setSessionState(state: any) {
+        saveSessionStateSync(state);
+      },
+      saveDraftSync(path: string, content: string) {
+        savePendingDraftSync(path, content);
+      },
+      clearDraftSync(path: string) {
+        clearPendingDraftSync(path);
       },
     };
     this.setupDragAndDrop();
@@ -91,6 +111,10 @@ export class WebIdeHostBridge {
     });
 
     if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        this.swReady = true;
+        this.pushPwaState();
+      });
       window.addEventListener('load', async () => {
         try {
           const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
@@ -132,13 +156,19 @@ export class WebIdeHostBridge {
         await this.ensureInitialized();
         this.pushPwaState();
         const urlTarget = new URLSearchParams(location.search).get('open');
-        const initialTarget = urlTarget && this.vfs.has(urlTarget)
-          ? urlTarget
-          : this.vfs.has('/Starter_Lab/Starter_Lab.uvprojx')
-            ? '/Starter_Lab/Starter_Lab.uvprojx'
-            : this.vfs.listFiles()[0];
-        if (initialTarget) {
-          this.emit({ type: 'openTarget', path: initialTarget });
+        const fallbackPath = this.vfs.has('/Starter_Lab/Starter_Lab.uvprojx')
+          ? '/Starter_Lab/Starter_Lab.uvprojx'
+          : this.vfs.listFiles()[0];
+
+        if (urlTarget && this.vfs.has(urlTarget)) {
+          this.emit({ type: 'openTarget', path: urlTarget });
+        } else {
+          const savedSession = loadSessionStateSync();
+          if (savedSession && typeof savedSession === 'object') {
+            this.emit({ type: 'restoreSession', session: savedSession, fallbackPath });
+          } else if (fallbackPath) {
+            this.emit({ type: 'openTarget', path: fallbackPath });
+          }
         }
       } catch (e: any) {
         console.error('Initialization failed:', e);

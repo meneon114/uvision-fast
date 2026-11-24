@@ -5,6 +5,82 @@ const DB_VERSION = 1;
 const STORE_FILES = 'files';
 const STORE_META = 'meta';
 
+export const PENDING_DRAFTS_KEY = 'uvision_fast_pending_drafts_v1';
+export const SESSION_STATE_KEY = 'uvision_fast_session_v1';
+
+function normDraftPath(p: string): string {
+  const clean = p.replace(/\\/g, '/');
+  return clean.startsWith('/') ? clean : '/' + clean;
+}
+
+export function readPendingDraftsSync(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(PENDING_DRAFTS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function savePendingDraftSync(path: string, content: string): void {
+  try {
+    const disp = normDraftPath(path);
+    const low = disp.toLowerCase();
+    const map = readPendingDraftsSync();
+    for (const k of Object.keys(map)) {
+      if (k.toLowerCase() === low && k !== disp) {
+        delete map[k];
+      }
+    }
+    map[disp] = content;
+    localStorage.setItem(PENDING_DRAFTS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+export function clearPendingDraftSync(path: string): void {
+  try {
+    const low = normDraftPath(path).toLowerCase();
+    const map = readPendingDraftsSync();
+    let changed = false;
+    for (const k of Object.keys(map)) {
+      if (k.toLowerCase() === low) {
+        delete map[k];
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    if (Object.keys(map).length === 0) {
+      localStorage.removeItem(PENDING_DRAFTS_KEY);
+    } else {
+      localStorage.setItem(PENDING_DRAFTS_KEY, JSON.stringify(map));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function loadSessionStateSync(): any {
+  try {
+    const raw = localStorage.getItem(SESSION_STATE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function saveSessionStateSync(state: any): void {
+  try {
+    localStorage.setItem(SESSION_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // ignore
+  }
+}
+
 export class VirtualFsStore {
   private db: IDBDatabase | null = null;
   private cache = new Map<string, string>(); // normPath -> content
@@ -46,6 +122,20 @@ export class VirtualFsStore {
         }
       }
       await this.setMeta('seeded_v1', true);
+    }
+
+    // Replay any write-ahead drafts flushed just before a reload/close
+    const drafts = readPendingDraftsSync();
+    const draftEntries = Object.entries(drafts);
+    if (draftEntries.length > 0) {
+      for (const [p, content] of draftEntries) {
+        await this.writeFile(p, String(content));
+      }
+      try {
+        localStorage.removeItem(PENDING_DRAFTS_KEY);
+      } catch {
+        // ignore
+      }
     }
   }
 

@@ -75,13 +75,23 @@ self.addEventListener('fetch', (event) => {
   const reqUrl = new URL(req.url);
   if (reqUrl.origin !== self.location.origin) return;
 
-  if (req.mode === 'navigate') {
+  if (req.mode === 'navigate' || reqUrl.pathname.endsWith('/manifest.webmanifest')) {
     event.respondWith(
-      caches.match(req, { ignoreSearch: true }).then((cached) => {
-        if (cached) return cached;
-        const indexUrl = new URL('./index.html', self.registration.scope).toString();
-        return caches.match(indexUrl).then((idx) => idx || fetch(req));
-      })
+      fetch(req, { cache: 'no-cache' })
+        .then((networkResp) => {
+          if (networkResp && networkResp.ok) {
+            const copy = networkResp.clone();
+            caches.open(CACHE_NAME).then((c) => c.put(req, copy));
+          }
+          return networkResp;
+        })
+        .catch(() =>
+          caches.match(req, { ignoreSearch: true }).then((cached) => {
+            if (cached) return cached;
+            const indexUrl = new URL('./index.html', self.registration.scope).toString();
+            return caches.match(indexUrl);
+          })
+        )
     );
     return;
   }
