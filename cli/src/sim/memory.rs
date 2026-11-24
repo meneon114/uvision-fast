@@ -127,7 +127,7 @@ impl Memory {
         self.dirty_sram.clear();
         for seg in &elf.segments {
             for (i, &b) in seg.data.iter().enumerate() {
-                self.load_byte(seg.vaddr.wrapping_add(i as u32), b);
+                self.load_byte(seg.paddr.wrapping_add(i as u32), b);
             }
         }
     }

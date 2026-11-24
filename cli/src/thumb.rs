@@ -991,6 +991,10 @@ fn decode_dp_plain(h1: u32, h2: u32) -> (Instr, bool) {
 fn decode_branch_misc(h1: u32, h2: u32, in_it: bool, last_in_it: bool) -> (Instr, bool) {
     let op1 = bits(h2, 14, 12);
     let op = bits(h1, 10, 4);
+    if op1 == 0b010 && op == 0b1111111 {
+        // UDF.W (permanently undefined; still UNDEFINED when executed)
+        return (Instr::Udf { imm: ((bits(h1, 3, 0) << 12) | (h2 & 0xFFF)) as u16 }, false);
+    }
     if op1 & 0b101 == 0b000 {
         if op & 0b0111000 != 0b0111000 {
             // B<cond>.W (T3)
@@ -1051,9 +1055,6 @@ fn decode_branch_misc(h1: u32, h2: u32, in_it: bool, last_in_it: bool) -> (Instr
             }
             _ => return (Instr::Undefined, false),
         }
-    }
-    if op1 == 0b010 && op == 0b1111111 {
-        return (Instr::Udf { imm: ((bits(h1, 3, 0) << 12) | (h2 & 0xFFF)) as u16 }, false);
     }
     if op1 & 0b101 == 0b100 {
         // BLX (immediate): switches to ARM state, UNDEFINED on ARMv7-M

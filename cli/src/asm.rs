@@ -1,10 +1,32 @@
+//! Built-in assembler + linker for Keil armasm syntax (Cortex-M3, STM32F1).
+//!
+//! Pipeline: parse every source into AREAs of statements -> synthesise the startup code a
+//! Keil project would link in (vector table, Reset_Handler, SystemInit, `__main`) unless
+//! the sources provide it -> iterative layout where instruction / literal-pool sizes only
+//! grow (so it always converges) -> encode -> ELF32 + DWARF line table, Intel HEX and BIN.
+//!
+//! Memory layout follows a default Keil scatter file: `RESET` first in flash, then the
+//! code and RO data, then the RW initialisation image; RW then ZI data in SRAM. RW data
+//! reaches RAM only through the scatter-load in `__main`, as on the chip.
+
+mod elfout;
+mod encode;
+mod expr;
+mod startup;
+
+pub use elfout::format_intel_hex;
+
 use crate::project::TargetOptions;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::project::UvProject;
-use crate::sim::cpu::thumb_expand_imm_c;
+use crate::sim::memory::DeviceMap;
 use crate::target::{BuildResult, Diagnostic};
-use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Result;
+use encode::{Ctx, Env, Insn, Op};
+use expr::{ExprError, Resolver, Val};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,57 +39,1428 @@ pub struct InMemoryBuild {
     pub bin_bytes: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectionKind {
-    Reset,
+/// Encode a 32-bit constant as a Thumb-2 modified immediate (i:imm3:imm8), if possible.
+pub fn encode_thumb_expand_imm(val: u32) -> Option<u16> {
+    encode::modimm(val).map(|v| v as u16)
+}
+
+// ---------------------------------------------------------------------------------------
+// Data model
+// ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum DataItem {
+    Expr(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+enum Body {
+    /// Zero-size anchor for labels at the end of an area.
+    Label,
+    Insn { insn: Box<Insn>, in_it: bool, last_in_it: bool, pool: Option<usize> },
+    Data { unit: u32, aligned: bool, items: Vec<DataItem> },
+    Space { size: String, fill: Option<String>, unit: u32 },
+    Align { align: u32 },
+    Pool(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Stmt {
+    file: usize,
+    line: u32,
+    area: usize,
+    body: Body,
+    pad: u32,
+    addr: u32,
+    size: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AreaKind {
     Code,
-    Data,
+    RoData,
+    RwData,
+    Zi,
 }
 
-#[derive(Debug, Clone)]
-struct SourceLineItem {
-    file_idx: usize,
-    file_path: String,
-    line: u32,
-    section: SectionKind,
-    label: Option<String>,
-    stmt: Option<Stmt>,
-}
-
-#[derive(Debug, Clone)]
-enum Stmt {
-    Dcd(Vec<String>),
-    Dcw(Vec<String>),
-    Dcb(Vec<String>),
-    Space(String),
-    Align(u32),
-    Ltorg,
-    Instr {
-        raw_mnem: String,
-        operands: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct SymEntry {
+#[derive(Clone, Debug)]
+struct Area {
     name: String,
-    addr: u32, // un-masked address; thumb func bit set separately if is_func
-    is_func: bool,
-    section: SectionKind,
+    file: usize,
+    kind: AreaKind,
+    align: u32,
+    reset: bool,
+    stmts: Vec<usize>,
+    base: u32,
+    size: u32,
 }
 
-#[derive(Debug, Clone)]
-struct LiteralEntry {
-    expr: String,
-    addr: u32,
+#[derive(Clone, Debug, Default)]
+struct Pool {
+    slots: Vec<u32>,
+    reserved: u32,
 }
 
-#[derive(Debug, Clone)]
-struct EmittedLine {
-    addr: u32,
-    file_idx: usize,
-    line: u32,
+#[derive(Clone, Copy, Debug)]
+enum LinkSym {
+    RwLoad,
+    RwBase,
+    RwLimit,
+    ZiLimit,
 }
+
+#[derive(Clone, Debug)]
+enum SymDef {
+    Label(usize),
+    Equ(String),
+    Linker(LinkSym),
+    /// Resolve `name` as seen from file `file` (used by the startup code to reach the
+    /// user's entry point even when it is not EXPORTed).
+    Ref(usize, String),
+}
+
+#[derive(Debug, Default)]
+struct SrcFile {
+    path: String,
+    virt: bool,
+    syms: HashMap<String, SymDef>,
+    sym_line: HashMap<String, u32>,
+    exports: HashSet<String>,
+    weak: HashSet<String>,
+    imports: HashSet<String>,
+    regs: HashMap<String, u8>,
+    entry: Option<usize>,
+}
+
+struct Proc {
+    file: usize,
+    name: String,
+    start: usize,
+    end: usize,
+}
+
+const HIDDEN_ENTRY: &str = "__uvf_entry_directive";
+
+struct Asm {
+    files: Vec<SrcFile>,
+    areas: Vec<Area>,
+    stmts: Vec<Stmt>,
+    pools: Vec<Pool>,
+    procs: Vec<Proc>,
+    diags: Vec<Diagnostic>,
+    strong: HashMap<String, usize>,
+    weak_glob: HashMap<String, usize>,
+    link: [u32; 4],
+    defines: Vec<(String, String)>,
+}
+
+// ---------------------------------------------------------------------------------------
+// Expression environment
+// ---------------------------------------------------------------------------------------
+
+struct R<'a> {
+    asm: &'a Asm,
+    file: usize,
+    pc: Option<u32>,
+    depth: Cell<u32>,
+}
+
+impl Resolver for R<'_> {
+    fn symbol(&self, name: &str) -> Option<Result<Val, ExprError>> {
+        self.asm.lookup(self.file, name, self.depth.get())
+    }
+    fn here(&self) -> Option<i64> {
+        self.pc.map(|p| p as i64)
+    }
+}
+
+struct FileEnv<'a> {
+    asm: &'a Asm,
+    file: usize,
+}
+
+impl Env for FileEnv<'_> {
+    fn eval(&self, e: &str, pc: u32) -> Result<Val, ExprError> {
+        self.asm.eval(self.file, e, Some(pc))
+    }
+}
+
+impl Asm {
+    fn new() -> Self {
+        Asm {
+            files: Vec::new(),
+            areas: Vec::new(),
+            stmts: Vec::new(),
+            pools: Vec::new(),
+            procs: Vec::new(),
+            diags: Vec::new(),
+            strong: HashMap::new(),
+            weak_glob: HashMap::new(),
+            link: [0; 4],
+            defines: Vec::new(),
+        }
+    }
+
+    fn eval(&self, file: usize, e: &str, pc: Option<u32>) -> Result<Val, ExprError> {
+        expr::eval(e, &R { asm: self, file, pc, depth: Cell::new(0) })
+    }
+
+    fn lookup(&self, file: usize, name: &str, depth: u32) -> Option<Result<Val, ExprError>> {
+        if depth > 40 {
+            return Some(Err(ExprError::Syntax(format!("Circular definition involving '{}'", name))));
+        }
+        let f = &self.files[file];
+        let local = f.syms.get(name);
+        if let Some(d) = local {
+            let overridden = f.weak.contains(name) && self.strong.get(name).is_some_and(|&g| g != file);
+            if !overridden {
+                return Some(self.def_val(file, d, depth));
+            }
+        }
+        for map in [&self.strong, &self.weak_glob] {
+            if let Some(&g) = map.get(name) {
+                if let Some(d) = self.files[g].syms.get(name) {
+                    return Some(self.def_val(g, d, depth));
+                }
+            }
+        }
+        None
+    }
+
+    fn def_val(&self, file: usize, d: &SymDef, depth: u32) -> Result<Val, ExprError> {
+        match d {
+            SymDef::Label(s) => {
+                let st = &self.stmts[*s];
+                Ok(Val { v: st.addr as i64, reloc: 1, thumb: matches!(st.body, Body::Insn { .. }) })
+            }
+            SymDef::Equ(e) => expr::eval(e, &R { asm: self, file, pc: None, depth: Cell::new(depth + 1) }),
+            SymDef::Linker(k) => Ok(Val { v: self.link[*k as usize] as i64, reloc: 1, thumb: false }),
+            SymDef::Ref(f2, n) => self.lookup(*f2, n, depth + 1).unwrap_or_else(|| Err(ExprError::Undefined(n.clone()))),
+        }
+    }
+
+    fn diag(&mut self, file: usize, line: u32, sev: &str, msg: impl Into<String>) {
+        self.diags.push(Diagnostic {
+            file: self.files[file].path.clone(),
+            line,
+            column: 1,
+            severity: sev.to_string(),
+            code: if sev == "error" { "ASM".into() } else { "ASMW".into() },
+            message: msg.into(),
+        });
+    }
+
+    fn errors(&self) -> usize {
+        self.diags.iter().filter(|d| d.severity == "error").count()
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Parser
+// ---------------------------------------------------------------------------------------
+
+#[derive(Default)]
+struct PState {
+    file: usize,
+    area: Option<usize>,
+    pending_labels: Vec<(String, u32)>,
+    pending_entry: bool,
+    it: VecDeque<u8>,
+    it_line: u32,
+    lits: HashMap<usize, Vec<usize>>,
+    proc_open: Option<(String, usize, u32)>,
+    /// IF stack: (this branch active, some branch already taken, parent active)
+    conds: Vec<(bool, bool, bool)>,
+    ended: bool,
+}
+
+const DIRECTIVES: &[&str] = &[
+    "AREA", "EXPORT", "GLOBAL", "IMPORT", "EXTERN", "ENTRY", "END", "PROC", "FUNCTION", "ENDP", "ENDFUNC", "THUMB",
+    "CODE16", "ARM", "CODE32", "PRESERVE8", "REQUIRE8", "ALIGN", "LTORG", "DCB", "DCW", "DCWU", "DCD", "DCDU", "DCQ",
+    "DCQU", "SPACE", "FILL", "EQU", "RN", "IF", "ELSE", "ELIF", "ENDIF", "INCLUDE", "GET", "INCBIN", "MACRO", "MEND",
+    "KEEP", "REQUIRE", "INFO", "ASSERT", "OPT", "TTL", "SUBT", "ATTR", "ROUT", "GBLA", "GBLL", "GBLS", "LCLA", "LCLL",
+    "LCLS", "SETA", "SETL", "SETS", "%",
+];
+
+fn is_directive(w: &str) -> bool {
+    let u = w.to_ascii_uppercase();
+    DIRECTIVES.contains(&u.as_str())
+}
+
+fn is_keyword(w: &str) -> bool {
+    is_directive(w) || encode::is_mnemonic(w) || w.starts_with('.')
+}
+
+fn split_first_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    match s.find(|c: char| c.is_whitespace()) {
+        Some(i) => (&s[..i], s[i..].trim()),
+        None => (s, ""),
+    }
+}
+
+fn strip_comment(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'\'' if i + 2 < b.len() && b[i + 2] == b'\'' => {
+                    i += 3;
+                    continue;
+                }
+                b';' | b'@' => return &line[..i],
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => return &line[..i],
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    line
+}
+
+fn valid_ident(s: &str) -> bool {
+    let mut ch = s.chars();
+    match ch.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    ch.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+fn unbar(s: &str) -> String {
+    let t = s.trim();
+    t.strip_prefix('|').and_then(|x| x.strip_suffix('|')).unwrap_or(t).to_string()
+}
+
+fn parse_string(s: &str) -> Result<Vec<u8>, String> {
+    let inner = s
+        .trim()
+        .strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .ok_or_else(|| format!("Malformed string {}", s))?;
+    let mut out = Vec::new();
+    let mut it = inner.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('n') => out.push(10),
+                Some('r') => out.push(13),
+                Some('t') => out.push(9),
+                Some('0') => out.push(0),
+                Some('\\') => out.push(b'\\'),
+                Some('"') => out.push(b'"'),
+                Some('\'') => out.push(b'\''),
+                Some(o) => {
+                    out.push(b'\\');
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(o.encode_utf8(&mut buf).as_bytes());
+                }
+                None => out.push(b'\\'),
+            }
+        } else if c == '"' && it.peek() == Some(&'"') {
+            it.next();
+            out.push(b'"');
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    Ok(out)
+}
+
+impl Asm {
+    fn add_file(&mut self, path: &str, virt: bool) -> usize {
+        let mut f = SrcFile { path: path.to_string(), virt, ..Default::default() };
+        if !virt {
+            for (n, v) in &self.defines {
+                f.syms.insert(n.clone(), SymDef::Equ(v.clone()));
+            }
+        }
+        self.files.push(f);
+        self.files.len() - 1
+    }
+
+    fn parse_file(&mut self, path: &str, text: &str, virt: bool) -> usize {
+        let file = self.add_file(path, virt);
+        let mut st = PState { file, ..Default::default() };
+        let mut last_line = 0;
+        for (i, raw) in text.lines().enumerate() {
+            last_line = i as u32 + 1;
+            if let Err(msg) = self.parse_line(&mut st, raw, last_line) {
+                self.diag(file, last_line, "error", msg);
+            }
+            if st.ended {
+                break;
+            }
+        }
+        self.finish_file(&mut st, last_line.max(1));
+        if !st.ended && !virt {
+            self.diag(file, last_line.max(1), "warning", "Missing END directive at the end of the file");
+        }
+        file
+    }
+
+    fn finish_file(&mut self, st: &mut PState, line: u32) {
+        if let Err(m) = self.leave_area(st, line) {
+            self.diag(st.file, line, "error", m);
+        }
+        if let Some((name, _, l)) = st.proc_open.take() {
+            self.diag(st.file, l, "error", format!("PROC '{}' has no matching ENDP", name));
+        }
+        if !st.conds.is_empty() {
+            self.diag(st.file, line, "error", "IF without matching ENDIF");
+        }
+        let mut areas: Vec<usize> = st.lits.keys().copied().collect();
+        areas.sort();
+        for a in areas {
+            let lits = st.lits.remove(&a).unwrap_or_default();
+            if !lits.is_empty() {
+                self.add_pool(st.file, line, a, &lits);
+            }
+        }
+    }
+
+    fn add_pool(&mut self, file: usize, line: u32, area: usize, lits: &[usize]) {
+        let p = self.pools.len();
+        self.pools.push(Pool::default());
+        let idx = self.raw_stmt(file, line, area, Body::Pool(p), 0);
+        let _ = idx;
+        for &l in lits {
+            if let Body::Insn { pool, .. } = &mut self.stmts[l].body {
+                *pool = Some(p);
+            }
+        }
+    }
+
+    fn raw_stmt(&mut self, file: usize, line: u32, area: usize, body: Body, size: u32) -> usize {
+        let idx = self.stmts.len();
+        self.stmts.push(Stmt { file, line, area, body, pad: 0, addr: 0, size });
+        self.areas[area].stmts.push(idx);
+        idx
+    }
+
+    /// Close the current area: bind trailing labels, check the IT block is complete.
+    fn leave_area(&mut self, st: &mut PState, line: u32) -> Result<(), String> {
+        let Some(a) = st.area else {
+            if let Some((l, ln)) = st.pending_labels.first() {
+                let (l, ln) = (l.clone(), *ln);
+                st.pending_labels.clear();
+                self.diag(st.file, ln, "error", format!("Label '{}' is outside any AREA", l));
+            }
+            return Ok(());
+        };
+        if !st.pending_labels.is_empty() || st.pending_entry {
+            let line_of = st.pending_labels.first().map(|x| x.1).unwrap_or(line);
+            let idx = self.raw_stmt(st.file, line_of, a, Body::Label, 0);
+            self.bind_pending(st, idx);
+        }
+        if !st.it.is_empty() {
+            st.it.clear();
+            return Err(format!("IT block starting at line {} is not complete", st.it_line));
+        }
+        Ok(())
+    }
+
+    fn bind_pending(&mut self, st: &mut PState, idx: usize) {
+        for (name, line) in std::mem::take(&mut st.pending_labels) {
+            self.define(st.file, &name, SymDef::Label(idx), line);
+        }
+        if st.pending_entry {
+            st.pending_entry = false;
+            if self.files[st.file].entry.is_none() {
+                self.files[st.file].entry = Some(idx);
+            }
+        }
+    }
+
+    fn define(&mut self, file: usize, name: &str, d: SymDef, line: u32) {
+        if let Some(prev) = self.files[file].sym_line.get(name) {
+            let prev = *prev;
+            self.diag(file, line, "error", format!("Symbol '{}' is already defined at line {}", name, prev));
+            return;
+        }
+        if encode::parse_reg(name).is_some() {
+            self.diag(file, line, "error", format!("'{}' is a register name and cannot be used as a symbol", name));
+            return;
+        }
+        self.files[file].syms.insert(name.to_string(), d);
+        self.files[file].sym_line.insert(name.to_string(), line);
+    }
+
+    fn push_stmt(&mut self, st: &mut PState, line: u32, body: Body, size: u32) -> Result<usize, String> {
+        let a = st.area.ok_or("No AREA directive before this statement")?;
+        let is_insn = matches!(body, Body::Insn { .. });
+        if !st.it.is_empty() && !is_insn {
+            return Err("Only instructions are allowed inside an IT block".into());
+        }
+        if is_insn && self.areas[a].kind != AreaKind::Code {
+            return Err(format!(
+                "Instruction in data AREA '{}'; instructions must be in an AREA declared with CODE",
+                self.areas[a].name
+            ));
+        }
+        if !is_insn && self.areas[a].kind == AreaKind::Zi {
+            if let Body::Data { items, .. } = &body {
+                let nonzero = items.iter().any(|i| match i {
+                    DataItem::Bytes(b) => b.iter().any(|&x| x != 0),
+                    DataItem::Expr(e) => e.trim() != "0",
+                });
+                if nonzero {
+                    self.diag(st.file, line, "warning", "Initialised data in a NOINIT area is ignored (zero-initialised at startup)");
+                }
+            }
+        }
+        let idx = self.raw_stmt(st.file, line, a, body, size);
+        self.bind_pending(st, idx);
+        Ok(idx)
+    }
+
+    fn regs_of(&self, file: usize) -> impl Fn(&str) -> Option<u8> + '_ {
+        move |s: &str| encode::parse_reg(s).or_else(|| self.files[file].regs.get(s.trim()).copied())
+    }
+
+    fn parse_line(&mut self, st: &mut PState, raw: &str, line: u32) -> Result<(), String> {
+        let code = strip_comment(raw);
+        let code = code.trim_end();
+        if code.trim().is_empty() {
+            return Ok(());
+        }
+        let col0 = !code.starts_with(|c: char| c.is_whitespace());
+
+        // Conditional assembly is evaluated before anything else.
+        let (fw, frest) = split_first_word(code);
+        let fwu = fw.to_ascii_uppercase();
+        match fwu.as_str() {
+            "IF" | "[" => {
+                let parent = st.conds.last().map(|c| c.0).unwrap_or(true);
+                let v = if parent { self.parse_time_cond(st.file, frest)? } else { false };
+                st.conds.push((parent && v, v, parent));
+                return Ok(());
+            }
+            "ELIF" => {
+                let Some(top) = st.conds.last_mut() else { return Err("ELIF without IF".into()) };
+                let (_, taken, parent) = *top;
+                if taken || !parent {
+                    top.0 = false;
+                } else {
+                    let v = self.parse_time_cond(st.file, frest)?;
+                    let top = st.conds.last_mut().unwrap();
+                    top.0 = v;
+                    top.1 = v;
+                }
+                return Ok(());
+            }
+            "ELSE" | "|" => {
+                let Some(top) = st.conds.last_mut() else { return Err("ELSE without IF".into()) };
+                top.0 = top.2 && !top.1;
+                top.1 = true;
+                return Ok(());
+            }
+            "ENDIF" | "]" => {
+                if st.conds.pop().is_none() {
+                    return Err("ENDIF without IF".into());
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        if st.conds.last().is_some_and(|c| !c.0) {
+            return Ok(());
+        }
+
+        // Label field
+        let (mut label, mut rest): (Option<String>, &str) = (None, code.trim());
+        let (w1, r1) = split_first_word(code);
+        let (w2, _) = split_first_word(r1);
+        if let Some(l) = w1.strip_suffix(':') {
+            label = Some(l.to_string());
+            rest = r1;
+        } else if col0 {
+            if w1.starts_with('.') && is_keyword(w1) {
+                // GNU directive in column 0
+            } else if is_directive(w1) && !w2.eq_ignore_ascii_case("EQU") && !w2.eq_ignore_ascii_case("RN") && !is_keyword(w2) {
+                self.diag(st.file, line, "warning", format!("Directive '{}' in column 1 is treated as a label by armasm; indent it", w1));
+            } else if encode::is_mnemonic(w1) && !r1.is_empty() && !is_keyword(w2) {
+                return Err(format!(
+                    "'{}' starts in column 1, so it is read as a label and '{}' as the instruction. Indent instructions with a space or tab",
+                    w1, w2
+                ));
+            } else {
+                label = Some(w1.to_string());
+                rest = r1;
+            }
+        } else if !is_keyword(w1) && !w2.is_empty() && is_keyword(w2) {
+            self.diag(st.file, line, "warning", format!("Label '{}' should start in column 1 (armasm treats an indented word as an instruction)", w1));
+            label = Some(w1.to_string());
+            rest = r1;
+        }
+        if let Some(l) = &label {
+            let l2 = unbar(l);
+            if !valid_ident(&l2) {
+                if l2.chars().all(|c| c.is_ascii_digit()) {
+                    return Err(format!("Numeric local label '{}' is not supported; use a named label", l2));
+                }
+                return Err(format!("Invalid label '{}'", l));
+            }
+            label = Some(l2);
+        }
+
+        let (op, args) = split_first_word(rest);
+        let opu = op.to_ascii_uppercase();
+
+        if op.is_empty() {
+            if let Some(l) = label {
+                st.pending_labels.push((l, line));
+            }
+            return Ok(());
+        }
+
+        // Directives that consume the label
+        match opu.as_str() {
+            "EQU" | "*" | ".EQU" | ".SET" if label.is_some() || opu.starts_with('.') => {
+                let (name, val) = if let Some(l) = label {
+                    (l, args.to_string())
+                } else {
+                    let parts = encode::split_operands(args);
+                    if parts.len() != 2 {
+                        return Err(format!("{} needs name, value", op));
+                    }
+                    (parts[0].clone(), parts[1].clone())
+                };
+                if val.trim().is_empty() {
+                    return Err(format!("EQU '{}' has no value", name));
+                }
+                let v = val.split(',').next().unwrap_or("").trim().to_string();
+                self.define(st.file, &name, SymDef::Equ(v), line);
+                return Ok(());
+            }
+            "EQU" | "*" => return Err(format!("{} needs a name in column 1", opu)),
+            _ => {}
+        }
+        if opu == "RN" {
+            let name = label.ok_or("RN needs a name in column 1")?;
+            let r = encode::parse_reg(args).ok_or_else(|| format!("RN: '{}' is not a register", args))?;
+            self.files[st.file].regs.insert(name, r);
+            return Ok(());
+        }
+        if matches!(opu.as_str(), "PROC" | "FUNCTION") {
+            let name = label.ok_or("PROC needs a label in column 1 (e.g. 'main PROC')")?;
+            if let Some((open, _, l)) = &st.proc_open {
+                return Err(format!("PROC '{}' inside PROC '{}' (line {}); add ENDP first", name, open, l));
+            }
+            st.proc_open = Some((name.clone(), self.stmts.len(), line));
+            st.pending_labels.push((name, line));
+            return Ok(());
+        }
+        if let Some(l) = label.take() {
+            st.pending_labels.push((l, line));
+        }
+        self.directive_or_insn(st, line, op, &opu, args)
+    }
+
+    fn parse_time_cond(&self, file: usize, e: &str) -> Result<bool, String> {
+        // Replace :DEF:sym with 1/0 (defined so far), then evaluate.
+        let mut s = e.to_string();
+        loop {
+            let up = s.to_ascii_uppercase();
+            let Some(i) = up.find(":DEF:") else { break };
+            let after = &s[i + 5..];
+            let after_t = after.trim_start();
+            let skip = after.len() - after_t.len();
+            let end = after_t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).unwrap_or(after_t.len());
+            let name = &after_t[..end];
+            let defined = self.files[file].syms.contains_key(name)
+                || self.files[file].regs.contains_key(name)
+                || self.strong.contains_key(name);
+            s = format!("{}{}{}", &s[..i], if defined { "1" } else { "0" }, &after_t[end..]);
+            let _ = skip;
+        }
+        let v = self.eval(file, &s, None).map_err(|e| format!("IF condition: {}", e))?;
+        Ok(v.v != 0)
+    }
+
+    fn area_directive(&mut self, st: &mut PState, line: u32, args: &str) -> Result<(), String> {
+        let parts = encode::split_operands(args);
+        if parts.is_empty() || parts[0].is_empty() {
+            return Err("AREA needs a name".into());
+        }
+        let name = unbar(&parts[0]);
+        let mut code = false;
+        let mut ro: Option<bool> = None;
+        let mut noinit = false;
+        let mut align = 4u32;
+        for p in &parts[1..] {
+            let up = p.trim().to_ascii_uppercase();
+            match up.as_str() {
+                "CODE" => code = true,
+                "DATA" => code = false,
+                "READONLY" => ro = Some(true),
+                "READWRITE" => ro = Some(false),
+                "NOINIT" => noinit = true,
+                "NOALLOC" | "COMDEF" | "COMMON" | "MERGE" | "STRINGS" => {}
+                _ => {
+                    if let Some(n) = up.strip_prefix("ALIGN") {
+                        let n = n.trim().trim_start_matches('=').trim();
+                        let v: u32 = n.parse().map_err(|_| format!("Bad AREA ALIGN value '{}'", p.trim()))?;
+                        if v > 31 {
+                            return Err("AREA ALIGN must be 0..31".into());
+                        }
+                        align = 1u32 << v;
+                    } else if !up.starts_with("ASSOC") && !up.starts_with("GROUP") && !up.starts_with("LINKORDER") {
+                        return Err(format!("Unknown AREA attribute '{}'", p.trim()));
+                    }
+                }
+            }
+        }
+        self.switch_area(st, line, &name, code, ro, noinit, align)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn switch_area(&mut self, st: &mut PState, line: u32, name: &str, code: bool, ro: Option<bool>, noinit: bool, align: u32) -> Result<(), String> {
+        self.leave_area(st, line)?;
+        let kind = if code {
+            if ro == Some(false) {
+                self.diag(st.file, line, "warning", "READWRITE code areas are placed in flash like READONLY ones");
+            }
+            AreaKind::Code
+        } else if noinit {
+            AreaKind::Zi
+        } else if ro == Some(true) {
+            AreaKind::RoData
+        } else {
+            AreaKind::RwData
+        };
+        let existing = self.areas.iter().position(|a| a.file == st.file && a.name == name);
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                self.areas.push(Area {
+                    name: name.to_string(),
+                    file: st.file,
+                    kind,
+                    align,
+                    reset: name == "RESET" || name == ".isr_vector",
+                    stmts: Vec::new(),
+                    base: 0,
+                    size: 0,
+                });
+                self.areas.len() - 1
+            }
+        };
+        st.area = Some(idx);
+        Ok(())
+    }
+
+    fn directive_or_insn(&mut self, st: &mut PState, line: u32, op: &str, opu: &str, args: &str) -> Result<(), String> {
+        let file = st.file;
+        let names = |args: &str| -> Vec<(String, bool)> {
+            encode::split_operands(args)
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let up = s.to_ascii_uppercase();
+                    let weak = up.contains("[WEAK") || up.ends_with(" WEAK");
+                    let n = s.split(|c: char| c.is_whitespace() || c == '[').next().unwrap_or("").to_string();
+                    (unbar(&n), weak)
+                })
+                .collect()
+        };
+        match opu {
+            "AREA" => return self.area_directive(st, line, args),
+            "EXPORT" | "GLOBAL" | ".GLOBAL" | ".GLOBL" | ".WEAK" => {
+                let list = names(args);
+                if list.is_empty() {
+                    return Err(format!("{} needs a symbol name", op));
+                }
+                for (n, weak) in list {
+                    self.files[file].exports.insert(n.clone());
+                    if weak || opu == ".WEAK" {
+                        self.files[file].weak.insert(n);
+                    }
+                }
+                return Ok(());
+            }
+            "IMPORT" | "EXTERN" | ".EXTERN" => {
+                for (n, _) in names(args) {
+                    self.files[file].imports.insert(n);
+                }
+                return Ok(());
+            }
+            "ENTRY" => {
+                st.pending_entry = true;
+                return Ok(());
+            }
+            "END" | ".END" => {
+                st.ended = true;
+                return Ok(());
+            }
+            "ENDP" | "ENDFUNC" => {
+                let Some((name, start, _)) = st.proc_open.take() else {
+                    return Err("ENDP without a matching PROC".into());
+                };
+                self.procs.push(Proc { file, name, start, end: self.stmts.len() });
+                return Ok(());
+            }
+            "THUMB" | "CODE16" | "PRESERVE8" | "REQUIRE8" | "KEEP" | "REQUIRE" | "INFO" | "ASSERT" | "OPT" | "TTL"
+            | "SUBT" | "ATTR" | "ROUT" | ".SYNTAX" | ".THUMB" | ".CPU" | ".FPU" | ".ARCH" | ".EABI_ATTRIBUTE"
+            | ".FILE" | ".TYPE" | ".SIZE" | ".THUMB_FUNC" | ".CODE" | ".FNSTART" | ".FNEND" | ".CANTUNWIND"
+            | ".IDENT" | ".PRESERVE8" => return Ok(()),
+            "ARM" | "CODE32" | ".ARM" => return Err("Cortex-M3 only executes Thumb code; remove ARM / CODE32".into()),
+            "INCLUDE" | "GET" | "INCBIN" | ".INCLUDE" => {
+                return Err(format!("{} is not supported by the built-in assembler; add the file to the project instead", op))
+            }
+            "MACRO" | "MEND" | "MEXIT" | ".MACRO" => return Err("Macros are not supported by the built-in assembler".into()),
+            "GBLA" | "GBLL" | "GBLS" | "LCLA" | "LCLL" | "LCLS" | "SETA" | "SETL" | "SETS" => {
+                return Err(format!("{} (assembly-time variables) is not supported; use EQU", op))
+            }
+            ".TEXT" => return self.switch_area(st, line, ".text", true, Some(true), false, 4),
+            ".DATA" => return self.switch_area(st, line, ".data", false, Some(false), false, 4),
+            ".BSS" => return self.switch_area(st, line, ".bss", false, Some(false), true, 4),
+            ".SECTION" => {
+                let n = unbar(encode::split_operands(args).first().map(|s| s.as_str()).unwrap_or(""));
+                let flags = args.to_ascii_lowercase();
+                let code = n.starts_with(".text") || flags.contains("\"ax\"") || flags.contains("\"xa\"");
+                let ro = n.starts_with(".rodata") || n == ".isr_vector" || (flags.contains("\"a\"") && !code);
+                let zi = n.starts_with(".bss") || n.starts_with(".noinit");
+                return self.switch_area(st, line, &n, code, Some(ro || code), zi, 4);
+            }
+            "ALIGN" | ".ALIGN" | ".BALIGN" | ".P2ALIGN" => {
+                let parts = encode::split_operands(args);
+                let a = if parts.is_empty() || parts[0].is_empty() {
+                    4
+                } else {
+                    let v = self.eval(file, &parts[0], None).map_err(|e| e.to_string())?.v;
+                    match opu {
+                        ".ALIGN" | ".P2ALIGN" => {
+                            if !(0..=16).contains(&v) {
+                                return Err("Alignment out of range".into());
+                            }
+                            1i64 << v
+                        }
+                        _ => v,
+                    }
+                };
+                if a <= 0 || a & (a - 1) != 0 || a > 65536 {
+                    return Err(format!("ALIGN value {} must be a power of two", a));
+                }
+                if parts.len() > 1 {
+                    return Err("ALIGN with an offset or padding value is not supported".into());
+                }
+                self.push_stmt(st, line, Body::Align { align: a as u32 }, 0)?;
+                return Ok(());
+            }
+            "LTORG" | ".LTORG" | ".POOL" => {
+                let a = st.area.ok_or("LTORG outside an AREA")?;
+                if !st.it.is_empty() {
+                    return Err("LTORG inside an IT block".into());
+                }
+                // bind labels before the pool to the pool start
+                let lits = st.lits.remove(&a).unwrap_or_default();
+                let p = self.pools.len();
+                self.pools.push(Pool::default());
+                self.push_stmt(st, line, Body::Pool(p), 0)?;
+                for l in lits {
+                    if let Body::Insn { pool, .. } = &mut self.stmts[l].body {
+                        *pool = Some(p);
+                    }
+                }
+                return Ok(());
+            }
+            "DCB" | "DCW" | "DCWU" | "DCD" | "DCDU" | "DCQ" | "DCQU" | ".BYTE" | ".HWORD" | ".SHORT" | ".2BYTE" | ".WORD"
+            | ".LONG" | ".4BYTE" | ".INT" | ".QUAD" | ".8BYTE" | ".ASCII" | ".ASCIZ" | ".STRING" => {
+                let (unit, aligned) = match opu {
+                    "DCB" | ".BYTE" | ".ASCII" | ".ASCIZ" | ".STRING" => (1, false),
+                    "DCW" => (2, true),
+                    "DCWU" | ".HWORD" | ".SHORT" | ".2BYTE" => (2, false),
+                    "DCD" => (4, true),
+                    "DCDU" | ".WORD" | ".LONG" | ".4BYTE" | ".INT" => (4, false),
+                    "DCQ" => (8, true),
+                    _ => (8, false),
+                };
+                let parts = encode::split_operands(args);
+                if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+                    return Err(format!("{} needs at least one value", op));
+                }
+                let mut items = Vec::new();
+                let mut size = 0u32;
+                for p in parts {
+                    if p.starts_with('"') {
+                        if unit != 1 {
+                            return Err("Strings are only allowed in DCB".into());
+                        }
+                        let mut b = parse_string(&p)?;
+                        if matches!(opu, ".ASCIZ" | ".STRING") {
+                            b.push(0);
+                        }
+                        size += b.len() as u32;
+                        items.push(DataItem::Bytes(b));
+                    } else {
+                        size += unit;
+                        items.push(DataItem::Expr(p));
+                    }
+                }
+                self.push_stmt(st, line, Body::Data { unit, aligned, items }, size)?;
+                return Ok(());
+            }
+            "SPACE" | "%" | ".SPACE" | ".SKIP" | ".ZERO" => {
+                if args.trim().is_empty() {
+                    return Err("SPACE needs a size".into());
+                }
+                let parts = encode::split_operands(args);
+                let fill = parts.get(1).cloned();
+                self.push_stmt(st, line, Body::Space { size: parts[0].clone(), fill, unit: 1 }, 0)?;
+                return Ok(());
+            }
+            "FILL" | ".FILL" => {
+                let parts = encode::split_operands(args);
+                if parts.is_empty() || parts[0].is_empty() {
+                    return Err("FILL needs a size".into());
+                }
+                let unit = match parts.get(2) {
+                    Some(u) => {
+                        let v = self.eval(file, u, None).map_err(|e| e.to_string())?.v;
+                        if ![1, 2, 4].contains(&v) {
+                            return Err("FILL value size must be 1, 2 or 4".into());
+                        }
+                        v as u32
+                    }
+                    None => 1,
+                };
+                let size = if opu == ".FILL" {
+                    // GNU: .fill repeat, size, value
+                    return Err(".fill is not supported; use .space".into());
+                } else {
+                    parts[0].clone()
+                };
+                self.push_stmt(st, line, Body::Space { size, fill: parts.get(1).cloned(), unit }, 0)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+        if op.starts_with('.') {
+            return Err(format!("Unknown directive '{}'", op));
+        }
+        let Some((base, s, cond, width, pattern)) = encode::split_mnemonic(op) else {
+            return Err(format!("Unknown opcode '{}' (labels must start in column 1; instructions must be indented)", op));
+        };
+        let regs = self.regs_of(file);
+        let mut ops = Vec::new();
+        if !args.trim().is_empty() {
+            for o in encode::split_operands(args) {
+                ops.push(encode::parse_operand(&o, &regs)?);
+            }
+        }
+        drop(regs);
+        let insn = Insn { base, s, cond, width, ops, it_pattern: pattern, text: op.to_string() };
+
+        // IT block bookkeeping
+        let (mut in_it, mut last_in_it) = (false, false);
+        if base == "IT" {
+            if !st.it.is_empty() {
+                return Err("IT instruction inside an IT block".into());
+            }
+            if cond != 14 {
+                return Err("IT cannot be conditional".into());
+            }
+            let c = match insn.ops.first() {
+                Some(Op::Expr(x)) => encode::parse_cond(&x.to_ascii_uppercase()),
+                _ => None,
+            }
+            .ok_or_else(|| format!("{} needs a condition (EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE)", op))?;
+            encode::it_mask(c, &insn.it_pattern)?;
+            st.it.push_back(c);
+            for ch in insn.it_pattern.chars() {
+                st.it.push_back(if ch == 'T' { c } else { c ^ 1 });
+            }
+            st.it_line = line;
+        } else if let Some(c) = st.it.pop_front() {
+            in_it = true;
+            last_in_it = st.it.is_empty();
+            let c_eff = if c == 14 { 14 } else { c };
+            if insn.cond != c_eff {
+                st.it.clear();
+                if insn.cond == 14 {
+                    return Err(format!(
+                        "Instruction in an IT block must carry the block's condition: write {}{}",
+                        op.to_ascii_uppercase(),
+                        crate::thumb::cond_name(c).to_ascii_uppercase()
+                    ));
+                }
+                return Err(format!(
+                    "Condition {} does not match the IT block (expected {})",
+                    crate::thumb::cond_name(insn.cond).to_ascii_uppercase(),
+                    crate::thumb::cond_name(c).to_ascii_uppercase()
+                ));
+            }
+        } else if cond != 14 && base != "B" {
+            return Err(format!(
+                "Conditional instruction '{}' outside an IT block. Thumb-2 needs 'IT {}' on the line before it",
+                op,
+                crate::thumb::cond_name(cond).to_ascii_uppercase()
+            ));
+        }
+        let is_lit = base == "LDR" && matches!(insn.ops.get(1), Some(Op::Lit(_)));
+        let idx = self.push_stmt(
+            st,
+            line,
+            Body::Insn { insn: Box::new(insn), in_it, last_in_it, pool: None },
+            2,
+        )?;
+        if is_lit {
+            let a = st.area.unwrap_or(0);
+            st.lits.entry(a).or_default().push(idx);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Linking: startup synthesis, layout, emission
+// ---------------------------------------------------------------------------------------
+
+struct Layout {
+    rom_order: Vec<usize>,
+    rw_order: Vec<usize>,
+    zi_order: Vec<usize>,
+    rom_end: u32,
+    rw_load: u32,
+    rw_base: u32,
+    rw_limit: u32,
+    zi_base: u32,
+    zi_limit: u32,
+}
+
+fn align_up(v: u32, a: u32) -> u32 {
+    if a <= 1 {
+        v
+    } else {
+        v.wrapping_add(a - 1) & !(a - 1)
+    }
+}
+
+impl Asm {
+    fn compute_globals(&mut self) {
+        self.strong.clear();
+        self.weak_glob.clear();
+        let mut dup = Vec::new();
+        for (fi, f) in self.files.iter().enumerate() {
+            for name in &f.exports {
+                if !f.syms.contains_key(name) {
+                    continue;
+                }
+                if f.weak.contains(name) {
+                    self.weak_glob.entry(name.clone()).or_insert(fi);
+                } else if let Some(&prev) = self.strong.get(name) {
+                    dup.push((fi, name.clone(), prev));
+                } else {
+                    self.strong.insert(name.clone(), fi);
+                }
+            }
+        }
+        for (fi, name, prev) in dup {
+            let line = self.files[fi].sym_line.get(&name).copied().unwrap_or(1);
+            let other = self.files[prev].path.clone();
+            self.diag(fi, line, "error", format!("Symbol '{}' is EXPORTed by more than one file (also in {})", name, other));
+        }
+    }
+
+    fn check_exports(&mut self) {
+        let mut errs = Vec::new();
+        for (fi, f) in self.files.iter().enumerate() {
+            for name in &f.exports {
+                if !f.syms.contains_key(name) && !f.weak.contains(name) {
+                    errs.push((fi, name.clone()));
+                }
+            }
+        }
+        for (fi, n) in errs {
+            self.diag(fi, 1, "error", format!("EXPORTed symbol '{}' is not defined in this file", n));
+        }
+    }
+
+    /// Find the user entry point the way Keil's runtime reaches it.
+    fn find_entry(&self) -> Option<(usize, String)> {
+        for name in ["__main", "main", "_main"] {
+            for (fi, f) in self.files.iter().enumerate() {
+                if !f.virt && matches!(f.syms.get(name), Some(SymDef::Label(_))) {
+                    return Some((fi, name.to_string()));
+                }
+            }
+        }
+        for (fi, f) in self.files.iter().enumerate() {
+            if f.entry.is_some() && !f.virt {
+                return Some((fi, HIDDEN_ENTRY.to_string()));
+            }
+        }
+        None
+    }
+
+    fn referenced_undefined(&self, name: &str) -> bool {
+        if self.strong.contains_key(name) || self.files.iter().any(|f| !f.virt && f.syms.contains_key(name) && !f.exports.contains(name)) {
+            return false;
+        }
+        self.files.iter().any(|f| f.imports.contains(name))
+    }
+
+    fn synthesize_startup(&mut self, options: &TargetOptions, map: &DeviceMap) -> Option<startup::Plan> {
+        // ENTRY directive -> hidden label
+        for fi in 0..self.files.len() {
+            if let Some(s) = self.files[fi].entry {
+                self.files[fi].syms.insert(HIDDEN_ENTRY.into(), SymDef::Label(s));
+            }
+        }
+        self.compute_globals();
+        let has_reset = self.areas.iter().any(|a| a.reset);
+        let entry = self.find_entry();
+        let plan = if !has_reset {
+            let Some((_, ename)) = &entry else {
+                if self.stmts.is_empty() {
+                    return None;
+                }
+                let f = self.files.iter().position(|f| !f.virt).unwrap_or(0);
+                self.diag(f, 1, "error", "No entry point: define __main, main or _main, or put ENTRY before the first instruction");
+                return None;
+            };
+            let to_user_main = ename == "__main";
+            startup::Plan {
+                vectors: true,
+                initial_sp: options.rw_base.max(0x2000_0000) + map.sram_size,
+                system_init: true,
+                main: !to_user_main,
+                reset_to_user_main: to_user_main,
+            }
+        } else {
+            let si = self.referenced_undefined("SystemInit");
+            let mn = self.referenced_undefined("__main");
+            if !si && !mn {
+                return None;
+            }
+            if mn && entry.is_none() {
+                let f = self.files.iter().position(|f| f.imports.contains("__main")).unwrap_or(0);
+                self.diag(f, 1, "error", "__main is IMPORTed but there is no main / ENTRY to call");
+                return None;
+            }
+            startup::Plan { vectors: false, initial_sp: 0, system_init: si, main: mn, reset_to_user_main: false }
+        };
+        let text = startup::generate(&plan);
+        let f = self.parse_file("<startup>", &text, true);
+        if let Some((ef, en)) = entry {
+            self.files[f].syms.insert("__uvf_user_entry".into(), SymDef::Ref(ef, en));
+        }
+        for (n, k) in [
+            ("__uvf_rw_load", LinkSym::RwLoad),
+            ("__uvf_rw_base", LinkSym::RwBase),
+            ("__uvf_rw_limit", LinkSym::RwLimit),
+            ("__uvf_zi_limit", LinkSym::ZiLimit),
+        ] {
+            self.files[f].syms.insert(n.into(), SymDef::Linker(k));
+        }
+        self.compute_globals();
+        Some(plan)
+    }
+
+    fn handler_warnings(&mut self) {
+        let handlers: HashSet<String> = startup::handler_names().into_iter().collect();
+        let mut warn = Vec::new();
+        for (fi, f) in self.files.iter().enumerate() {
+            if f.virt {
+                continue;
+            }
+            for (name, d) in &f.syms {
+                if matches!(d, SymDef::Label(_)) && handlers.contains(name) && !f.exports.contains(name) && self.weak_glob.contains_key(name) {
+                    warn.push((fi, name.clone(), f.sym_line.get(name).copied().unwrap_or(1)));
+                }
+            }
+        }
+        for (fi, n, l) in warn {
+            self.diag(
+                fi,
+                l,
+                "warning",
+                format!("'{}' is not EXPORTed, so the vector table uses the default handler (an endless loop). Add 'EXPORT {}'", n, n),
+            );
+        }
+    }
+
+    fn orders(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let virt = |a: &Area| self.files[a.file].virt;
+        let mut rom: Vec<usize> = (0..self.areas.len()).filter(|&i| self.areas[i].reset).collect();
+        rom.extend((0..self.areas.len()).filter(|&i| {
+            let a = &self.areas[i];
+            !a.reset && virt(a) && matches!(a.kind, AreaKind::Code | AreaKind::RoData)
+        }));
+        rom.extend((0..self.areas.len()).filter(|&i| {
+            let a = &self.areas[i];
+            !a.reset && !virt(a) && matches!(a.kind, AreaKind::Code | AreaKind::RoData)
+        }));
+        let rw = (0..self.areas.len()).filter(|&i| !self.areas[i].reset && self.areas[i].kind == AreaKind::RwData).collect();
+        let zi = (0..self.areas.len()).filter(|&i| !self.areas[i].reset && self.areas[i].kind == AreaKind::Zi).collect();
+        (rom, rw, zi)
+    }
+
+    fn place_area(&mut self, a: usize, start: u32) -> u32 {
+        let mut pc = align_up(start, self.areas[a].align);
+        self.areas[a].base = pc;
+        let ids = self.areas[a].stmts.clone();
+        for s in ids {
+            let st = &self.stmts[s];
+            let al = match &st.body {
+                Body::Insn { .. } => 2,
+                Body::Data { unit, aligned: true, .. } => (*unit).min(4),
+                Body::Align { align } => *align,
+                Body::Pool(_) => 4,
+                _ => 1,
+            };
+            let size = match &st.body {
+                Body::Pool(p) => self.pools[*p].reserved * 4,
+                _ => st.size,
+            };
+            let addr = align_up(pc, al);
+            let st = &mut self.stmts[s];
+            st.pad = addr - pc;
+            st.addr = addr;
+            st.size = size;
+            pc = addr + size;
+        }
+        self.areas[a].size = pc - self.areas[a].base;
+        pc
+    }
+
+    fn place(&mut self, ro_base: u32, rw_base: u32, lay: &mut Layout) {
+        let mut pc = ro_base;
+        for &a in &lay.rom_order.clone() {
+            pc = self.place_area(a, pc);
+        }
+        let rw_load = align_up(pc, 4);
+        let mut ram = rw_base;
+        for &a in &lay.rw_order.clone() {
+            ram = self.place_area(a, ram);
+        }
+        let rw_limit = align_up(ram, 4);
+        let zi_base = rw_limit;
+        let mut z = zi_base;
+        for &a in &lay.zi_order.clone() {
+            z = self.place_area(a, z);
+        }
+        let zi_limit = align_up(z, 4);
+        lay.rw_load = rw_load;
+        lay.rw_base = rw_base;
+        lay.rw_limit = rw_limit;
+        lay.zi_base = zi_base;
+        lay.zi_limit = zi_limit;
+        lay.rom_end = rw_load + (rw_limit - rw_base);
+        self.link = [rw_load, rw_base, rw_limit, zi_limit];
+    }
+
+    fn lit_expr(&self, s: usize) -> Option<&str> {
+        match &self.stmts[s].body {
+            Body::Insn { insn, .. } if insn.base == "LDR" => match insn.ops.get(1) {
+                Some(Op::Lit(e)) => Some(e.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn lit_addr(&self, s: usize) -> Option<u32> {
+        let Body::Insn { pool: Some(p), .. } = &self.stmts[s].body else { return None };
+        let e = self.lit_expr(s)?;
+        let v = self.eval(self.stmts[s].file, e, Some(self.stmts[s].addr)).ok()?;
+        let dv = v.data_value();
+        let slot = self.pools[*p].slots.iter().position(|&x| x == dv)?;
+        let pool_stmt = self.stmts.iter().position(|st| matches!(st.body, Body::Pool(q) if q == *p))?;
+        Some(self.stmts[pool_stmt].addr + 4 * slot as u32)
+    }
+
+    fn encode_stmt(&self, s: usize, force_wide: bool) -> Result<Vec<u8>, String> {
+        let st = &self.stmts[s];
+        let Body::Insn { insn, in_it, last_in_it, .. } = &st.body else { return Ok(Vec::new()) };
+        let ctx = Ctx { pc: st.addr, in_it: *in_it, last_in_it: *last_in_it, force_wide, lit_addr: self.lit_addr(s) };
+        encode::encode(insn, ctx, &FileEnv { asm: self, file: st.file })
+    }
+
+    /// One measurement pass; returns true if any reservation grew.
+    /// Re-size every statement for the current placement. The first passes size exactly
+    /// (a size may shrink once addresses settle, e.g. a branch to an absolute address
+    /// measured while everything before it was still zero-sized); later passes only grow,
+    /// which guarantees termination.
+    fn measure(&mut self, exact: bool) -> bool {
+        let mut changed = false;
+        // literal pools
+        let mut slots: Vec<Vec<u32>> = vec![Vec::new(); self.pools.len()];
+        for s in 0..self.stmts.len() {
+            let Body::Insn { pool: Some(p), .. } = &self.stmts[s].body else { continue };
+            let p = *p;
+            let Some(e) = self.lit_expr(s) else { continue };
+            if let Ok(v) = self.eval(self.stmts[s].file, e, Some(self.stmts[s].addr)) {
+                if encode::literal_needs_pool(&v) {
+                    let dv = v.data_value();
+                    if !slots[p].contains(&dv) {
+                        slots[p].push(dv);
+                    }
+                }
+            }
+        }
+        for (p, sl) in slots.into_iter().enumerate() {
+            let n = sl.len() as u32;
+            if n > self.pools[p].reserved || (exact && n != self.pools[p].reserved) {
+                self.pools[p].reserved = n;
+                changed = true;
+            }
+            self.pools[p].slots = sl;
+        }
+        for s in 0..self.stmts.len() {
+            let need = match &self.stmts[s].body {
+                Body::Insn { .. } => match self.encode_stmt(s, false) {
+                    Ok(b) => b.len() as u32,
+                    Err(_) => 0,
+                },
+                Body::Space { size, .. } => match self.eval(self.stmts[s].file, size, Some(self.stmts[s].addr)) {
+                    Ok(v) if v.is_const() && (0..=0x0100_0000).contains(&v.v) => v.v as u32,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            if need > self.stmts[s].size || (exact && need != self.stmts[s].size) {
+                self.stmts[s].size = need;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn emit_stmt(&self, s: usize) -> Result<Vec<u8>, String> {
+        let st = &self.stmts[s];
+        let file = st.file;
+        match &st.body {
+            Body::Label | Body::Align { .. } => Ok(Vec::new()),
+            Body::Insn { in_it, .. } => {
+                let mut b = self.encode_stmt(s, st.size == 4)?;
+                if b.len() == 2 && st.size == 4 {
+                    if *in_it {
+                        return Err("internal: relaxation needs a 32-bit form inside an IT block; add .W".into());
+                    }
+                    b.extend_from_slice(&[0x00, 0xBF]);
+                }
+                if b.len() as u32 != st.size {
+                    return Err("internal: instruction size changed during layout".into());
+                }
+                Ok(b)
+            }
+            Body::Data { unit, items, .. } => {
+                let mut out = Vec::new();
+                for it in items {
+                    match it {
+                        DataItem::Bytes(b) => out.extend_from_slice(b),
+                        DataItem::Expr(e) => {
+                            let pc = st.addr + out.len() as u32;
+                            let v = self.eval(file, e, Some(pc)).map_err(|x| x.to_string())?;
+                            match unit {
+                                1 => {
+                                    if !v.is_const() {
+                                        return Err(format!("DCB value '{}' is an address; use DCD", e));
+                                    }
+                                    if !(-128..=255).contains(&v.v) {
+                                        return Err(format!("DCB value {} out of range (-128..255)", v.v));
+                                    }
+                                    out.push(v.v as u8);
+                                }
+                                2 => {
+                                    if !(-32768..=65535).contains(&v.v) {
+                                        return Err(format!("DCW value {} out of range (-32768..65535)", v.v));
+                                    }
+                                    out.extend_from_slice(&(v.data_value() as u16).to_le_bytes());
+                                }
+                                4 => {
+                                    if v.v < i32::MIN as i64 || v.v > u32::MAX as i64 {
+                                        return Err(format!("DCD value 0x{:X} does not fit in 32 bits", v.v));
+                                    }
+                                    out.extend_from_slice(&v.data_value().to_le_bytes());
+                                }
+                                _ => out.extend_from_slice(&(v.v as u64).to_le_bytes()),
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Body::Space { fill, unit, .. } => {
+                let fv = match fill {
+                    Some(f) => {
+                        let v = self.eval(file, f, Some(st.addr)).map_err(|x| x.to_string())?;
+                        v.v as u32
+                    }
+                    None => 0,
+                };
+                let mut out = Vec::with_capacity(st.size as usize);
+                let bytes = fv.to_le_bytes();
+                for i in 0..st.size as usize {
+                    out.push(bytes[i % *unit as usize]);
+                }
+                Ok(out)
+            }
+            Body::Pool(p) => {
+                let pool = &self.pools[*p];
+                let mut out = Vec::new();
+                for v in &pool.slots {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out.resize(st.size as usize, 0);
+                Ok(out)
+            }
+        }
+    }
+
+    fn size_of_area_bytes(&self, kinds: &[AreaKind], virt: Option<bool>, insn_only: Option<bool>) -> u32 {
+        let mut n = 0;
+        for a in &self.areas {
+            if !kinds.contains(&a.kind) || virt.is_some_and(|v| self.files[a.file].virt != v) {
+                continue;
+            }
+            for &s in &a.stmts {
+                let st = &self.stmts[s];
+                let is_insn = matches!(st.body, Body::Insn { .. });
+                if insn_only.is_none_or(|i| i == is_insn) {
+                    n += st.size + st.pad;
+                }
+            }
+        }
+        n
+    }
+}
+
+fn fill_pad(buf: &mut [u8], start_addr: u32, code: bool) {
+    if !code {
+        return;
+    }
+    let mut i = 0;
+    if start_addr & 1 == 1 && !buf.is_empty() {
+        buf[0] = 0;
+        i = 1;
+    }
+    while i + 2 <= buf.len() {
+        buf[i] = 0x00;
+        buf[i + 1] = 0xBF;
+        i += 2;
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn assemble_project(project: &UvProject) -> Result<BuildResult> {
@@ -75,40 +1468,28 @@ pub fn assemble_project(project: &UvProject) -> Result<BuildResult> {
     let build_dir = project.build_dir();
     std::fs::create_dir_all(&build_dir)?;
 
-    let mut missing_diags: Vec<Diagnostic> = Vec::new();
-    let mut missing_log: Vec<String> = vec![format!(
-        "*** Using Built-in uVision Fast Assembler ({}, Cortex-M3)",
-        project.options.device
-    )];
+    let mut missing: Vec<Diagnostic> = Vec::new();
     let mut sources: Vec<(String, String)> = Vec::new();
-
     for src in project.source_files() {
         if src.file_type != 2 {
             continue;
         }
         let p = Path::new(&src.abs_path);
-        if !p.exists() {
-            missing_diags.push(Diagnostic {
+        match std::fs::read(p) {
+            Ok(bytes) => sources.push((src.abs_path.clone(), String::from_utf8_lossy(&bytes).into_owned())),
+            Err(_) => missing.push(Diagnostic {
                 file: src.abs_path.clone(),
                 line: 1,
                 column: 1,
                 severity: "error".to_string(),
                 code: "ENOENT".to_string(),
                 message: format!("Source file not found: {}", src.abs_path),
-            });
-            continue;
+            }),
         }
-        let text = std::fs::read_to_string(p)?;
-        sources.push((src.abs_path.clone(), text));
     }
-
-    if !missing_diags.is_empty() {
-        let errs = missing_diags.len();
+    if !missing.is_empty() {
+        let errs = missing.len();
         let elapsed = t0.elapsed().as_millis() as u64;
-        missing_log.push(format!(
-            "Built-in assemble failed: {} Error(s). [{} ms]",
-            errs, elapsed
-        ));
         return Ok(BuildResult {
             success: false,
             axf_path: None,
@@ -117,23 +1498,17 @@ pub fn assemble_project(project: &UvProject) -> Result<BuildResult> {
             elapsed_ms: elapsed,
             errors: errs,
             warnings: 0,
-            diagnostics: missing_diags,
-            log: missing_log.join("\n"),
+            diagnostics: missing,
+            log: format!(
+                "*** Using Built-in uVision Fast Assembler ({}, Cortex-M3)\nBuilt-in assemble failed: {} Error(s). [{} ms]",
+                project.options.device, errs, elapsed
+            ),
         });
     }
 
     let axf_path = project.axf_path();
-    let hex_path = if project.options.create_hex {
-        Some(project.hex_path())
-    } else {
-        None
-    };
-    let bin_path = if project.options.create_bin {
-        Some(project.bin_path())
-    } else {
-        None
-    };
-
+    let hex_path = project.options.create_hex.then(|| project.hex_path());
+    let bin_path = project.options.create_bin.then(|| project.bin_path());
     let mut mem = assemble_sources(
         &project.options,
         &axf_path.to_string_lossy(),
@@ -141,23 +1516,46 @@ pub fn assemble_project(project: &UvProject) -> Result<BuildResult> {
         bin_path.as_ref().map(|p| p.to_string_lossy().into_owned()).as_deref(),
         &sources,
     );
-
     if mem.result.success {
         if let Some(elf) = &mem.elf_bytes {
             std::fs::write(&axf_path, elf)?;
         }
-        if let (Some(hp), Some(hex_text)) = (hex_path, &mem.hex_text) {
-            std::fs::write(&hp, hex_text)?;
+        if let (Some(hp), Some(t)) = (hex_path, &mem.hex_text) {
+            std::fs::write(&hp, t)?;
         }
-        if let (Some(bp), Some(bin_bytes)) = (bin_path, &mem.bin_bytes) {
-            std::fs::write(&bp, bin_bytes)?;
+        if let (Some(bp), Some(b)) = (bin_path, &mem.bin_bytes) {
+            std::fs::write(&bp, b)?;
         }
     }
-
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     mem.result.elapsed_ms = elapsed_ms;
     mem.result.log = format!("{} [{} ms]", mem.result.log, elapsed_ms);
     Ok(mem.result)
+}
+
+fn failed(log: &mut Vec<String>, asm: Asm) -> InMemoryBuild {
+    let errors = asm.errors();
+    let warnings = asm.diags.len() - errors;
+    for d in &asm.diags {
+        log.push(format!("{}({}): {}: {}", d.file, d.line, d.severity, d.message));
+    }
+    log.push(format!("Built-in assemble failed: {} Error(s), {} Warning(s).", errors, warnings));
+    InMemoryBuild {
+        result: BuildResult {
+            success: false,
+            axf_path: None,
+            hex_path: None,
+            bin_path: None,
+            elapsed_ms: 0,
+            errors,
+            warnings,
+            diagnostics: asm.diags,
+            log: log.join("\n"),
+        },
+        elf_bytes: None,
+        hex_text: None,
+        bin_bytes: None,
+    }
 }
 
 pub fn assemble_sources(
@@ -167,331 +1565,232 @@ pub fn assemble_sources(
     bin_label: Option<&str>,
     sources: &[(String, String)],
 ) -> InMemoryBuild {
-    let mut log = vec![format!(
-        "*** Using Built-in uVision Fast Assembler ({}, Cortex-M3)",
-        options.device
-    )];
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let mut equs: HashMap<String, i64> = HashMap::new();
-    let mut items: Vec<SourceLineItem> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-
-    for (src_path, text) in sources {
-        let name = src_path.replace('\\', "/");
-        let short_name = name.rsplit('/').next().unwrap_or(src_path);
-        log.push(format!("assembling {} (built-in)...", short_name));
-        let file_idx = files.len();
-        files.push(src_path.clone());
-        parse_asm_file(text, file_idx, src_path, &mut equs, &mut items, &mut diagnostics);
-    }
-
-    if !diagnostics.is_empty() {
-        for d in &diagnostics {
-            log.push(format!("{}({}): error: {}", d.file, d.line, d.message));
-        }
-        let errs = diagnostics.len();
-        log.push(format!("Built-in assemble failed: {} Error(s).", errs));
-        return InMemoryBuild {
-            result: BuildResult {
-                success: false,
-                axf_path: None,
-                hex_path: None,
-                bin_path: None,
-                elapsed_ms: 0,
-                errors: errs,
-                warnings: 0,
-                diagnostics,
-                log: log.join("\n"),
-            },
-            elf_bytes: None,
-            hex_text: None,
-            bin_bytes: None,
+    let mut log = vec![format!("*** Using Built-in uVision Fast Assembler ({}, Cortex-M3)", options.device)];
+    let map = DeviceMap::for_device(&options.device);
+    let mut asm = Asm::new();
+    for d in &options.a_defines {
+        let (n, v) = match d.split_once('=') {
+            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
+            None => (d.trim().to_string(), "1".to_string()),
         };
+        if valid_ident(&n) {
+            asm.defines.push((n, v));
+        }
+    }
+    for (path, text) in sources {
+        let short = path.replace('\\', "/");
+        let short = short.rsplit('/').next().unwrap_or(path);
+        log.push(format!("assembling {}...", short));
+        asm.parse_file(path, text, false);
+    }
+    if asm.errors() > 0 {
+        return failed(&mut log, asm);
+    }
+    asm.check_exports();
+    let plan = asm.synthesize_startup(options, &map);
+    asm.handler_warnings();
+    if asm.errors() > 0 {
+        return failed(&mut log, asm);
     }
 
+    // Layout
+    let (rom_order, rw_order, zi_order) = asm.orders();
+    let mut lay = Layout {
+        rom_order,
+        rw_order,
+        zi_order,
+        rom_end: 0,
+        rw_load: 0,
+        rw_base: 0,
+        rw_limit: 0,
+        zi_base: 0,
+        zi_limit: 0,
+    };
     let ro_base = options.ro_base;
     let rw_base = options.rw_base;
-
-    // Partition items into Reset, Code, Data preserving order within each
-    let mut reset_items = Vec::new();
-    let mut code_items = Vec::new();
-    let mut data_items = Vec::new();
-    for it in items {
-        match it.section {
-            SectionKind::Reset => reset_items.push(it),
-            SectionKind::Code => code_items.push(it),
-            SectionKind::Data => data_items.push(it),
-        }
-    }
-
-    // Iterative layout pass to resolve addresses + literal pool
-    let mut symbols: HashMap<String, SymEntry> = HashMap::new();
-    let mut literals: Vec<LiteralEntry> = Vec::new();
-    let mut reset_size = 0u32;
-    let mut code_size = 0u32;
-    let mut data_size = 0u32;
-
-    for pass in 0..6 {
-        let mut next_symbols: HashMap<String, SymEntry> = HashMap::new();
-        literals.clear();
-
-        // 1) Reset section at ro_base
-        let mut pc = ro_base;
-        for it in &reset_items {
-            if let Some(lbl) = &it.label {
-                next_symbols.insert(
-                    lbl.clone(),
-                    SymEntry {
-                        name: lbl.clone(),
-                        addr: pc,
-                        is_func: false,
-                        section: SectionKind::Reset,
-                    },
-                );
-            }
-            if let Some(st) = &it.stmt {
-                pc = advance_pc(pc, st, &equs, &symbols, &mut literals, pass == 0);
-            }
-        }
-        pc = (pc + 3) & !3;
-        reset_size = pc - ro_base;
-
-        // 2) Code section right after Reset
-        let code_base = ro_base + reset_size;
-        pc = code_base;
-        for it in &code_items {
-            if let Some(lbl) = &it.label {
-                next_symbols.insert(
-                    lbl.clone(),
-                    SymEntry {
-                        name: lbl.clone(),
-                        addr: pc,
-                        is_func: true,
-                        section: SectionKind::Code,
-                    },
-                );
-            }
-            if let Some(st) = &it.stmt {
-                if matches!(st, Stmt::Ltorg) {
-                    pc = (pc + 3) & !3;
-                    for lit in &mut literals {
-                        if lit.addr == 0 {
-                            lit.addr = pc;
-                            pc += 4;
-                        }
-                    }
-                } else {
-                    pc = advance_pc(pc, st, &equs, &symbols, &mut literals, pass == 0);
-                }
-            }
-        }
-        // Flush remaining literal pool at end of code section
-        pc = (pc + 3) & !3;
-        for lit in &mut literals {
-            if lit.addr == 0 {
-                lit.addr = pc;
-                pc += 4;
-            }
-        }
-        code_size = pc - code_base;
-
-        // 3) Data section at rw_base
-        pc = rw_base;
-        for it in &data_items {
-            if let Some(lbl) = &it.label {
-                next_symbols.insert(
-                    lbl.clone(),
-                    SymEntry {
-                        name: lbl.clone(),
-                        addr: pc,
-                        is_func: false,
-                        section: SectionKind::Data,
-                    },
-                );
-            }
-            if let Some(st) = &it.stmt {
-                pc = advance_pc(pc, st, &equs, &symbols, &mut literals, pass == 0);
-            }
-        }
-        data_size = pc - rw_base;
-
-        let converged = pass > 0
-            && next_symbols.len() == symbols.len()
-            && next_symbols
-                .iter()
-                .all(|(k, v)| symbols.get(k).map(|s| s.addr) == Some(v.addr));
-        symbols = next_symbols;
-        if converged {
+    let mut converged = false;
+    for pass in 0..200 {
+        asm.place(ro_base, rw_base, &mut lay);
+        if !asm.measure(pass < 8) {
+            converged = true;
             break;
         }
     }
+    if !converged {
+        let f = asm.files.iter().position(|f| !f.virt).unwrap_or(0);
+        asm.diag(f, 1, "error", "internal: layout did not converge");
+        return failed(&mut log, asm);
+    }
 
-    // Pass 2: Emit bytes
-    let mut ro_bytes: Vec<u8> = Vec::with_capacity((reset_size + code_size) as usize);
-    let mut rw_bytes: Vec<u8> = Vec::with_capacity(data_size as usize);
-    let mut line_rows: Vec<EmittedLine> = Vec::new();
-    let mut lit_cursor = 0usize;
-    let mut lit_emit_cursor = 0usize;
-
-    // Emit Reset section
-    for it in &reset_items {
-        let cur_addr = ro_base + ro_bytes.len() as u32;
-        if let Some(st) = &it.stmt {
-            if let Err(msg) = emit_stmt(
-                cur_addr,
-                st,
-                &equs,
-                &symbols,
-                &literals,
-                &mut lit_cursor,
-                &mut ro_bytes,
-                None,
-            ) {
-                diagnostics.push(Diagnostic {
-                    file: it.file_path.clone(),
-                    line: it.line,
-                    column: 1,
-                    severity: "error".to_string(),
-                    code: "ASM".to_string(),
-                    message: msg.to_string(),
-                });
+    // Emit
+    let rom_len = (lay.rom_end - ro_base) as usize;
+    let mut rom = vec![0u8; rom_len];
+    let rw_len = (lay.rw_limit - lay.rw_base) as usize;
+    let mut rw = vec![0u8; rw_len];
+    let mut rows: Vec<elfout::LineRow> = Vec::new();
+    let mut dwarf_files: Vec<String> = Vec::new();
+    let mut dwarf_idx: HashMap<usize, usize> = HashMap::new();
+    for (fi, f) in asm.files.iter().enumerate() {
+        if !f.virt {
+            dwarf_idx.insert(fi, dwarf_files.len());
+            dwarf_files.push(f.path.clone());
+        }
+    }
+    let mut errs: Vec<(usize, u32, String)> = Vec::new();
+    let regions: Vec<(Vec<usize>, bool)> = vec![(lay.rom_order.clone(), true), (lay.rw_order.clone(), false)];
+    for (order, is_rom) in regions {
+        for a in order {
+            let code = asm.areas[a].kind == AreaKind::Code;
+            for &s in &asm.areas[a].stmts {
+                let st = &asm.stmts[s];
+                let (buf, base) = if is_rom { (&mut rom, ro_base) } else { (&mut rw, lay.rw_base) };
+                let start = (st.addr - st.pad - base) as usize;
+                fill_pad(&mut buf[start..start + st.pad as usize], st.addr - st.pad, code);
+                match asm.emit_stmt(s) {
+                    Ok(b) => {
+                        let off = (st.addr - base) as usize;
+                        buf[off..off + b.len()].copy_from_slice(&b);
+                        if matches!(st.body, Body::Insn { .. }) {
+                            if let Some(&di) = dwarf_idx.get(&st.file) {
+                                rows.push(elfout::LineRow { addr: st.addr, file: di, line: st.line });
+                            }
+                        }
+                    }
+                    Err(m) => errs.push((st.file, st.line, m)),
+                }
             }
         }
     }
-    while ro_bytes.len() < reset_size as usize {
-        ro_bytes.push(0);
+    for (f, l, m) in errs {
+        asm.diag(f, l, "error", m);
     }
+    if rom_len as u32 > map.flash_size {
+        let f = asm.files.iter().position(|f| !f.virt).unwrap_or(0);
+        asm.diag(f, 1, "error", format!("Program ({} bytes) does not fit in the {} KB flash of {}", rom_len, map.flash_size / 1024, map.name));
+    }
+    let ram_used = lay.zi_limit - lay.rw_base;
+    if ram_used > map.sram_size {
+        let f = asm.files.iter().position(|f| !f.virt).unwrap_or(0);
+        asm.diag(f, 1, "error", format!("RW + ZI data ({} bytes) does not fit in the {} KB SRAM of {}", ram_used, map.sram_size / 1024, map.name));
+    }
+    let scatter = plan.as_ref().is_some_and(|p| p.main && !p.reset_to_user_main);
+    if rw_len > 0 && !scatter {
+        let a = lay.rw_order[0];
+        let f = asm.areas[a].file;
+        let line = asm.areas[a].stmts.first().map(|&s| asm.stmts[s].line).unwrap_or(1);
+        asm.diag(
+            f,
+            line,
+            "warning",
+            format!(
+                "READWRITE data in AREA '{}' is only copied to RAM by the C library's __main (scatter-load); with your own entry code it starts uninitialised on the chip",
+                asm.areas[a].name
+            ),
+        );
+    }
+    if asm.errors() > 0 {
+        return failed(&mut log, asm);
+    }
+    rows.sort_by_key(|r| r.addr);
 
-    // Emit Code section
-    for it in &code_items {
-        let cur_addr = ro_base + ro_bytes.len() as u32;
-        if let Some(st) = &it.stmt {
-            if matches!(st, Stmt::Ltorg) {
-                while (ro_bytes.len() & 3) != 0 {
-                    ro_bytes.push(0);
-                }
-                while lit_emit_cursor < literals.len() && literals[lit_emit_cursor].addr == ro_base + ro_bytes.len() as u32 {
-                    let v = eval_expr(&literals[lit_emit_cursor].expr, &equs, &symbols).unwrap_or(0) as u32;
-                    ro_bytes.extend_from_slice(&v.to_le_bytes());
-                    lit_emit_cursor += 1;
-                }
+    // Symbols
+    let mut syms: Vec<elfout::Sym> = Vec::new();
+    let mut proc_size: HashMap<(usize, String), u32> = HashMap::new();
+    for p in &asm.procs {
+        if p.end > p.start {
+            let first = &asm.stmts[p.start];
+            let last = &asm.stmts[p.end - 1];
+            if first.area == last.area {
+                proc_size.insert((p.file, p.name.clone()), last.addr + last.size - first.addr);
+            }
+        }
+    }
+    for (fi, f) in asm.files.iter().enumerate() {
+        let mut names: Vec<&String> = f.syms.keys().collect();
+        names.sort();
+        for name in names {
+            if name == HIDDEN_ENTRY {
                 continue;
             }
-            let before = ro_bytes.len();
-            if let Err(msg) = emit_stmt(
-                cur_addr,
-                st,
-                &equs,
-                &symbols,
-                &literals,
-                &mut lit_cursor,
-                &mut ro_bytes,
-                None,
-            ) {
-                diagnostics.push(Diagnostic {
-                    file: it.file_path.clone(),
-                    line: it.line,
-                    column: 1,
-                    severity: "error".to_string(),
-                    code: "ASM".to_string(),
-                    message: msg.to_string(),
-                });
-            } else if matches!(st, Stmt::Instr { .. }) && ro_bytes.len() > before {
-                line_rows.push(EmittedLine {
-                    addr: cur_addr,
-                    file_idx: it.file_idx,
-                    line: it.line,
-                });
-            }
+            let SymDef::Label(s) = &f.syms[name] else { continue };
+            let st = &asm.stmts[*s];
+            let thumb = matches!(st.body, Body::Insn { .. });
+            let sec = match asm.areas[st.area].kind {
+                AreaKind::Code | AreaKind::RoData => elfout::Sec::Text,
+                AreaKind::RwData => elfout::Sec::Data,
+                AreaKind::Zi => elfout::Sec::Bss,
+            };
+            syms.push(elfout::Sym {
+                name: name.clone(),
+                value: if thumb { st.addr | 1 } else { st.addr },
+                size: proc_size.get(&(fi, name.clone())).copied().unwrap_or(0),
+                global: f.exports.contains(name),
+                func: thumb,
+                notype: false,
+                sec,
+            });
         }
     }
-    while (ro_bytes.len() & 3) != 0 {
-        ro_bytes.push(0);
-    }
-    while lit_emit_cursor < literals.len() {
-        let v = eval_expr(&literals[lit_emit_cursor].expr, &equs, &symbols).unwrap_or(0) as u32;
-        ro_bytes.extend_from_slice(&v.to_le_bytes());
-        lit_emit_cursor += 1;
-    }
-
-    // Emit Data section
-    for it in &data_items {
-        let cur_addr = rw_base + rw_bytes.len() as u32;
-        if let Some(st) = &it.stmt {
-            if let Err(msg) = emit_stmt(
-                cur_addr,
-                st,
-                &equs,
-                &symbols,
-                &literals,
-                &mut lit_cursor,
-                &mut rw_bytes,
-                None,
-            ) {
-                diagnostics.push(Diagnostic {
-                    file: it.file_path.clone(),
-                    line: it.line,
-                    column: 1,
-                    severity: "error".to_string(),
-                    code: "ASM".to_string(),
-                    message: msg.to_string(),
+    // Mapping symbols ($t code / $d data)
+    let mut last: Option<bool> = None;
+    for &a in lay.rom_order.iter().chain(lay.rw_order.iter()) {
+        let rw_area = asm.areas[a].kind == AreaKind::RwData;
+        if rw_area {
+            last = None;
+        }
+        for &s in &asm.areas[a].stmts {
+            let st = &asm.stmts[s];
+            if st.size == 0 {
+                continue;
+            }
+            let is_code = matches!(st.body, Body::Insn { .. });
+            if last != Some(is_code) {
+                syms.push(elfout::Sym {
+                    name: if is_code { "$t".into() } else { "$d".into() },
+                    value: st.addr,
+                    size: 0,
+                    global: false,
+                    func: false,
+                    notype: true,
+                    sec: if rw_area { elfout::Sec::Data } else { elfout::Sec::Text },
                 });
+                last = Some(is_code);
             }
         }
     }
 
-    if !diagnostics.is_empty() {
-        for d in &diagnostics {
-            log.push(format!("{}({}): error: {}", d.file, d.line, d.message));
-        }
-        let errs = diagnostics.len();
-        log.push(format!("Built-in assemble failed: {} Error(s).", errs));
-        return InMemoryBuild {
-            result: BuildResult {
-                success: false,
-                axf_path: None,
-                hex_path: None,
-                bin_path: None,
-                elapsed_ms: 0,
-                errors: errs,
-                warnings: 0,
-                diagnostics,
-                log: log.join("\n"),
-            },
-            elf_bytes: None,
-            hex_text: None,
-            bin_bytes: None,
-        };
-    }
-
-    let entry = symbols
-        .get("Reset_Handler")
-        .or_else(|| symbols.get("main"))
-        .or_else(|| symbols.get("_start"))
-        .map(|s| s.addr | 1)
-        .unwrap_or((ro_base + reset_size) | 1);
-
-    let elf_bytes = build_elf32(
+    let entry = if rom.len() >= 8 {
+        u32::from_le_bytes([rom[4], rom[5], rom[6], rom[7]])
+    } else {
+        ro_base | 1
+    };
+    let zi_size = lay.zi_limit - lay.zi_base;
+    let elf_bytes = elfout::build(&elfout::Image {
         entry,
-        ro_base,
-        &ro_bytes,
-        rw_base,
-        &rw_bytes,
-        &symbols,
-        &files,
-        &line_rows,
-    );
-    let hex_text = format_intel_hex(ro_base, &ro_bytes);
-    let bin_bytes = ro_bytes.clone();
+        rom_base: ro_base,
+        rom: &rom[..(lay.rw_load - ro_base) as usize],
+        rw: (rw_len > 0).then_some((lay.rw_base, lay.rw_load, rw.as_slice())),
+        zi: (zi_size > 0).then_some((lay.zi_base, zi_size)),
+        syms,
+        files: &dwarf_files,
+        rows: &rows,
+    });
+    let mut image = rom.clone();
+    image[(lay.rw_load - ro_base) as usize..].copy_from_slice(&rw);
+    let hex_text = format_intel_hex(ro_base, &image);
 
+    let code = asm.size_of_area_bytes(&[AreaKind::Code], None, None);
+    let ro_data = asm.size_of_area_bytes(&[AreaKind::RoData], None, None);
+    let errors = 0;
+    let warnings = asm.diags.len();
+    for d in &asm.diags {
+        log.push(format!("{}({}): {}: {}", d.file, d.line, d.severity, d.message));
+    }
     log.push(format!(
-        "Program Size: Code={} bytes, RO-data={} bytes, RW-data={} bytes",
-        code_size, reset_size, rw_bytes.len()
+        "Program Size: Code={} RO-data={} RW-data={} ZI-data={}",
+        code, ro_data, rw_len, zi_size
     ));
-    log.push(format!(
-        "\"{}\" - 0 Error(s), 0 Warning(s).",
-        axf_label
-    ));
+    log.push(format!("\"{}\" - {} Error(s), {} Warning(s).", axf_label, errors, warnings));
 
     InMemoryBuild {
         result: BuildResult {
@@ -500,1943 +1799,16 @@ pub fn assemble_sources(
             hex_path: hex_label.map(|s| s.to_string()),
             bin_path: bin_label.map(|s| s.to_string()),
             elapsed_ms: 0,
-            errors: 0,
-            warnings: 0,
-            diagnostics,
+            errors,
+            warnings,
+            diagnostics: asm.diags,
             log: log.join("\n"),
         },
         elf_bytes: Some(elf_bytes),
         hex_text: Some(hex_text),
-        bin_bytes: Some(bin_bytes),
+        bin_bytes: Some(image),
     }
 }
 
-fn parse_asm_file(
-    text: &str,
-    file_idx: usize,
-    file_path: &str,
-    equs: &mut HashMap<String, i64>,
-    items: &mut Vec<SourceLineItem>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let mut section = SectionKind::Code;
-    for (idx, raw_line) in text.lines().enumerate() {
-        let line_no = (idx + 1) as u32;
-        let stripped = strip_comment(raw_line);
-        if stripped.trim().is_empty() {
-            continue;
-        }
-
-        // Handle EQU early (e.g. NAME EQU 0x100)
-        if let Some((eq_name, eq_val)) = try_parse_equ(stripped) {
-            if let Ok(v) = eval_expr(eq_val, equs, &HashMap::new()) {
-                equs.insert(eq_name.to_string(), v);
-                continue;
-            }
-        }
-
-        let leading_ws = stripped.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
-        let mut rest = stripped.trim();
-        let mut label: Option<String> = None;
-
-        // Colon label anywhere (e.g. "Reset_Handler:")
-        if let Some(colon) = find_label_colon(rest) {
-            let cand = rest[..colon].trim();
-            if is_valid_ident(cand) {
-                label = Some(cand.to_string());
-                rest = rest[colon + 1..].trim();
-            }
-        } else if !leading_ws {
-            // Keil column-0 label (without colon)
-            let mut end = 0;
-            for (bi, ch) in rest.char_indices() {
-                if ch.is_whitespace() {
-                    break;
-                }
-                end = bi + ch.len_utf8();
-            }
-            let first = &rest[..end];
-            let first_up = first.to_ascii_uppercase();
-            if !is_directive(&first_up) && is_valid_ident(first) {
-                label = Some(first.to_string());
-                rest = rest[end..].trim();
-            }
-        }
-
-        if rest.is_empty() {
-            if label.is_some() {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: None,
-                });
-            }
-            continue;
-        }
-
-        let (head, tail) = split_first_word(rest);
-        let head_up = head.to_ascii_uppercase();
-
-        match head_up.as_str() {
-            "PRESERVE8" | "REQUIRE8" | "THUMB" | "ARM" | "ENTRY" | "EXPORT" | "GLOBAL"
-            | "IMPORT" | "EXTERN" | ".SYNTAX" | ".THUMB" | ".CPU" | ".GLOBAL" | ".GLOBL"
-            | ".TYPE" | ".TEXT" => {
-                if head_up == ".TEXT" {
-                    section = SectionKind::Code;
-                }
-                if label.is_some() {
-                    items.push(SourceLineItem {
-                        file_idx,
-                        file_path: file_path.to_string(),
-                        line: line_no,
-                        section,
-                        label,
-                        stmt: None,
-                    });
-                }
-            }
-            "END" => {
-                if label.is_some() {
-                    items.push(SourceLineItem {
-                        file_idx,
-                        file_path: file_path.to_string(),
-                        line: line_no,
-                        section,
-                        label,
-                        stmt: None,
-                    });
-                }
-                break;
-            }
-            "AREA" | ".SECTION" => {
-                let tail_up = tail.to_ascii_uppercase();
-                if tail_up.contains("RESET") || tail_up.contains("VECTORS") {
-                    section = SectionKind::Reset;
-                } else if tail_up.contains("READWRITE") || tail_up.contains(".DATA") || tail_up.contains(".BSS") {
-                    section = SectionKind::Data;
-                } else {
-                    section = SectionKind::Code;
-                }
-                if label.is_some() {
-                    items.push(SourceLineItem {
-                        file_idx,
-                        file_path: file_path.to_string(),
-                        line: line_no,
-                        section,
-                        label,
-                        stmt: None,
-                    });
-                }
-            }
-            "ALIGN" | ".ALIGN" | ".BALIGN" => {
-                let align_val = tail
-                    .split(',')
-                    .next()
-                    .and_then(|s| eval_expr(s.trim(), equs, &HashMap::new()).ok())
-                    .map(|v| v.max(1) as u32)
-                    .unwrap_or(4);
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Align(align_val)),
-                });
-            }
-            "LTORG" | ".LTORG" => {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Ltorg),
-                });
-            }
-            "DCD" | "DCDU" | ".WORD" | ".LONG" => {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Dcd(split_operands(tail))),
-                });
-            }
-            "DCW" | "DCWU" | ".HWORD" | ".SHORT" => {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Dcw(split_operands(tail))),
-                });
-            }
-            "DCB" | ".BYTE" => {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Dcb(split_operands(tail))),
-                });
-            }
-            "SPACE" | "FILL" | ".SPACE" => {
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Space(tail.trim().to_string())),
-                });
-            }
-            _ => {
-                if tail.is_empty() && !is_zero_operand_mnem(&head_up) && is_valid_ident(head) {
-                    diagnostics.push(Diagnostic {
-                        file: file_path.to_string(),
-                        line: line_no,
-                        column: 1,
-                        severity: "error".to_string(),
-                        code: "A1163E".to_string(),
-                        message: format!("Unknown opcode '{}' (if it is a label, put it at column 0 or add ':')", head),
-                    });
-                    continue;
-                }
-                items.push(SourceLineItem {
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    line: line_no,
-                    section,
-                    label,
-                    stmt: Some(Stmt::Instr {
-                        raw_mnem: head_up,
-                        operands: split_operands(tail),
-                    }),
-                });
-            }
-        }
-    }
-}
-
-fn advance_pc(
-    pc: u32,
-    stmt: &Stmt,
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    literals: &mut Vec<LiteralEntry>,
-    first_pass: bool,
-) -> u32 {
-    match stmt {
-        Stmt::Dcd(v) => pc + (v.len() as u32) * 4,
-        Stmt::Dcw(v) => pc + (v.len() as u32) * 2,
-        Stmt::Dcb(v) => pc + count_dcb_bytes(v),
-        Stmt::Space(expr) => pc + (eval_expr(expr, equs, symbols).unwrap_or(0).max(0) as u32),
-        Stmt::Align(a) => {
-            let align = (*a).max(1);
-            let rem = pc % align;
-            if rem == 0 { pc } else { pc + (align - rem) }
-        }
-        Stmt::Ltorg => (pc + 3) & !3,
-        Stmt::Instr { raw_mnem, operands } => {
-            if raw_mnem == "LDR" && operands.len() == 2 && operands[1].trim().starts_with('=') {
-                let expr = operands[1].trim()[1..].trim().to_string();
-                literals.push(LiteralEntry { expr, addr: 0 });
-                return pc + 4;
-            }
-            let sz = measure_instr(pc, raw_mnem, operands, equs, symbols, first_pass);
-            pc + sz
-        }
-    }
-}
-
-fn measure_instr(
-    pc: u32,
-    mnem: &str,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    first_pass: bool,
-) -> u32 {
-    let mut tmp = Vec::new();
-    let dummy_lits = Vec::new();
-    let mut dummy_cur = 0;
-    if encode_instr(pc, mnem, ops, equs, symbols, &dummy_lits, &mut dummy_cur, &mut tmp, true).is_ok() {
-        tmp.len() as u32
-    } else if first_pass {
-        // Forward-reference branch/load default size
-        4
-    } else {
-        4
-    }
-}
-
-fn emit_stmt(
-    pc: u32,
-    stmt: &Stmt,
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    literals: &[LiteralEntry],
-    lit_cursor: &mut usize,
-    out: &mut Vec<u8>,
-    _unused: Option<()>,
-) -> Result<()> {
-    match stmt {
-        Stmt::Dcd(v) => {
-            for e in v {
-                let val = eval_expr_for_data(e, equs, symbols)?;
-                out.extend_from_slice(&val.to_le_bytes());
-            }
-        }
-        Stmt::Dcw(v) => {
-            for e in v {
-                let val = eval_expr(e, equs, symbols)? as u16;
-                out.extend_from_slice(&val.to_le_bytes());
-            }
-        }
-        Stmt::Dcb(v) => {
-            for e in v {
-                let t = e.trim();
-                if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-                    out.extend_from_slice(t[1..t.len() - 1].as_bytes());
-                } else {
-                    let val = eval_expr(t, equs, symbols)? as u8;
-                    out.push(val);
-                }
-            }
-        }
-        Stmt::Space(expr) => {
-            let n = eval_expr(expr, equs, symbols)?.max(0) as usize;
-            out.resize(out.len() + n, 0);
-        }
-        Stmt::Align(a) => {
-            let align = (*a).max(1) as usize;
-            let rem = (pc as usize) % align;
-            if rem != 0 {
-                out.resize(out.len() + (align - rem), 0);
-            }
-        }
-        Stmt::Ltorg => {}
-        Stmt::Instr { raw_mnem, operands } => {
-            encode_instr(pc, raw_mnem, operands, equs, symbols, literals, lit_cursor, out, false)?;
-        }
-    }
-    Ok(())
-}
-
-fn encode_instr(
-    pc: u32,
-    raw_mnem: &str,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    literals: &[LiteralEntry],
-    lit_cursor: &mut usize,
-    out: &mut Vec<u8>,
-    sizing_only: bool,
-) -> Result<()> {
-    let (base, setflags, wide, cond) = parse_mnemonic(raw_mnem);
-
-    // Zero-operand hints
-    match base.as_str() {
-        "NOP" => { out.extend_from_slice(&0xBF00u16.to_le_bytes()); return Ok(()); }
-        "WFE" => { out.extend_from_slice(&0xBF20u16.to_le_bytes()); return Ok(()); }
-        "WFI" => { out.extend_from_slice(&0xBF30u16.to_le_bytes()); return Ok(()); }
-        "SEV" => { out.extend_from_slice(&0xBF40u16.to_le_bytes()); return Ok(()); }
-        "DSB" => { out.extend_from_slice(&0xF3BFu16.to_le_bytes()); out.extend_from_slice(&0x8F4Fu16.to_le_bytes()); return Ok(()); }
-        "DMB" => { out.extend_from_slice(&0xF3BFu16.to_le_bytes()); out.extend_from_slice(&0x8F5Fu16.to_le_bytes()); return Ok(()); }
-        "ISB" => { out.extend_from_slice(&0xF3BFu16.to_le_bytes()); out.extend_from_slice(&0x8F6Fu16.to_le_bytes()); return Ok(()); }
-        "SVC" => {
-            let imm = eval_imm(ops.first().map(|s| s.as_str()).unwrap_or("#0"), equs, symbols)? as u16;
-            out.extend_from_slice(&(0xDF00 | (imm & 0xFF)).to_le_bytes());
-            return Ok(());
-        }
-        "BKPT" => {
-            let imm = eval_imm(ops.first().map(|s| s.as_str()).unwrap_or("#0"), equs, symbols)? as u16;
-            out.extend_from_slice(&(0xBE00 | (imm & 0xFF)).to_le_bytes());
-            return Ok(());
-        }
-        "CPSID" | "CPSIE" => {
-            let dis = if base == "CPSID" { 1u16 << 4 } else { 0 };
-            let flag = ops.first().map(|s| s.trim().to_ascii_uppercase()).unwrap_or_default();
-            let i_bit = if flag.contains('I') { 2 } else { 0 };
-            let f_bit = if flag.contains('F') { 1 } else { 0 };
-            out.extend_from_slice(&(0xB660 | dis | i_bit | f_bit).to_le_bytes());
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    // Branches
-    if base == "B" {
-        let target_str = ops.first().ok_or_else(|| anyhow!("Missing branch target"))?;
-        let target = match eval_branch_target(target_str, equs, symbols) {
-            Ok(t) => t,
-            Err(e) if sizing_only => {
-                // Assume 4 bytes for unknown forward branch
-                let _ = e;
-                out.extend_from_slice(&[0; 4]);
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        let off = (target as i64) - ((pc + 4) as i64);
-        if (off & 1) != 0 {
-            return Err(anyhow!("Unaligned branch offset {}", off));
-        }
-        if let Some(c) = cond {
-            if !wide && (-256..=254).contains(&off) {
-                let imm8 = ((off >> 1) as i8 as u8) as u16;
-                out.extend_from_slice(&(0xD000 | ((c as u16) << 8) | imm8).to_le_bytes());
-                return Ok(());
-            }
-            if !(-1048576..=1048574).contains(&off) {
-                return Err(anyhow!("Conditional branch out of range: {}", off));
-            }
-            let enc = encode_t32_bcond(c, off as i32);
-            out.extend_from_slice(&enc.0.to_le_bytes());
-            out.extend_from_slice(&enc.1.to_le_bytes());
-            return Ok(());
-        } else {
-            if !wide && (-2048..=2046).contains(&off) {
-                let imm11 = ((off >> 1) as u32 & 0x7FF) as u16;
-                out.extend_from_slice(&(0xE000 | imm11).to_le_bytes());
-                return Ok(());
-            }
-            let enc = encode_t32_b_bl(off as i32, false);
-            out.extend_from_slice(&enc.0.to_le_bytes());
-            out.extend_from_slice(&enc.1.to_le_bytes());
-            return Ok(());
-        }
-    }
-
-    if base == "BL" {
-        let target_str = ops.first().ok_or_else(|| anyhow!("Missing BL target"))?;
-        let target = if sizing_only {
-            pc + 4
-        } else {
-            eval_branch_target(target_str, equs, symbols)?
-        };
-        let off = (target as i64) - ((pc + 4) as i64);
-        let enc = encode_t32_b_bl(off as i32, true);
-        out.extend_from_slice(&enc.0.to_le_bytes());
-        out.extend_from_slice(&enc.1.to_le_bytes());
-        return Ok(());
-    }
-
-    if base == "BX" || base == "BLX" {
-        let rm = parse_reg(ops.first().ok_or_else(|| anyhow!("Missing register"))?)?;
-        let bit7 = if base == "BLX" { 1u16 << 7 } else { 0 };
-        out.extend_from_slice(&(0x4700 | bit7 | ((rm as u16) << 3)).to_le_bytes());
-        return Ok(());
-    }
-
-    if base == "CBZ" || base == "CBNZ" {
-        if ops.len() < 2 {
-            return Err(anyhow!("CBZ/CBNZ expects Rn, label"));
-        }
-        let rn = parse_reg(&ops[0])?;
-        if rn > 7 {
-            return Err(anyhow!("CBZ/CBNZ only supports R0-R7"));
-        }
-        let target = if sizing_only { pc + 4 } else { eval_branch_target(&ops[1], equs, symbols)? };
-        let off = (target as i64) - ((pc + 4) as i64);
-        if !(0..=126).contains(&off) {
-            return Err(anyhow!("CBZ/CBNZ offset {} out of range (0..126)", off));
-        }
-        let nz = if base == "CBNZ" { 1u16 << 11 } else { 0 };
-        let imm6 = (off >> 1) as u16;
-        let i = (imm6 >> 5) & 1;
-        let imm5 = imm6 & 0x1F;
-        out.extend_from_slice(&(0xB100 | nz | (i << 9) | (imm5 << 3) | (rn as u16)).to_le_bytes());
-        return Ok(());
-    }
-
-    if base == "PUSH" || base == "POP" {
-        let is_pop = base == "POP";
-        let list_str = ops.join(",");
-        let mask = parse_reg_list(&list_str)?;
-        let extra_bit = if is_pop { 1u16 << 15 } else { 1u16 << 14 };
-        if (mask & !0x00FF & !extra_bit) == 0 {
-            let m = if (mask & extra_bit) != 0 { 1u16 << 8 } else { 0 };
-            let base_op = if is_pop { 0xBC00 } else { 0xB400 };
-            out.extend_from_slice(&(base_op | m | (mask & 0xFF)).to_le_bytes());
-        } else {
-            let hw1 = if is_pop { 0xE8BDu16 } else { 0xE92Du16 };
-            out.extend_from_slice(&hw1.to_le_bytes());
-            out.extend_from_slice(&mask.to_le_bytes());
-        }
-        return Ok(());
-    }
-
-    if base == "STM" || base == "STMIA" || base == "LDM" || base == "LDMIA" || base == "STMDB" || base == "LDMDB" {
-        if ops.len() < 2 {
-            return Err(anyhow!("{} expects Rn(!), {{regs}}", base));
-        }
-        let rn_raw = ops[0].trim();
-        let wback = rn_raw.ends_with('!');
-        let rn = parse_reg(rn_raw.trim_end_matches('!'))?;
-        let mask = parse_reg_list(&ops[1..].join(","))?;
-        let is_load = base.starts_with("LDM");
-        let is_db = base.ends_with("DB");
-        if !is_db && rn < 8 && (mask & !0xFF) == 0 {
-            let op16 = if is_load { 0xC800 } else { 0xC000 };
-            out.extend_from_slice(&(op16 | ((rn as u16) << 8) | (mask & 0xFF)).to_le_bytes());
-        } else {
-            let op_bits = if is_db { 2u16 << 7 } else { 1u16 << 7 };
-            let l_bit = if is_load { 1u16 << 4 } else { 0 };
-            let w_bit = if wback { 1u16 << 5 } else { 0 };
-            let hw1 = 0xE800 | op_bits | w_bit | l_bit | (rn as u16);
-            out.extend_from_slice(&hw1.to_le_bytes());
-            out.extend_from_slice(&mask.to_le_bytes());
-        }
-        return Ok(());
-    }
-
-    // Load / Store single
-    if matches!(base.as_str(), "LDR" | "LDRB" | "LDRSB" | "LDRH" | "LDRSH" | "STR" | "STRB" | "STRH") {
-        return encode_ldst(pc, &base, ops, equs, symbols, literals, lit_cursor, out, sizing_only);
-    }
-
-    // ADR (default 32-bit T3 so PC-mod-4 parity never oscillates across layout passes; ADR.N for 16-bit)
-    if base == "ADR" {
-        if ops.len() < 2 {
-            return Err(anyhow!("ADR expects Rd, label"));
-        }
-        let rd = parse_reg(&ops[0])?;
-        let target = if sizing_only { pc + 4 } else { eval_branch_target(&ops[1], equs, symbols)? };
-        let base_pc = (pc + 4) & !3;
-        let off = (target as i64) - (base_pc as i64);
-        if raw_mnem.eq_ignore_ascii_case("ADR.N") {
-            if rd < 8 && off >= 0 && (off & 3) == 0 && off <= 1020 {
-                out.extend_from_slice(&(0xA000 | ((rd as u16) << 8) | ((off >> 2) as u16)).to_le_bytes());
-                return Ok(());
-            }
-            return Err(anyhow!("ADR.N offset {} invalid or unaligned", off));
-        }
-        if off >= 0 && off <= 4095 {
-            let imm12 = off as u16;
-            let (i, imm3, imm8) = split_imm12(imm12);
-            out.extend_from_slice(&(0xF20F | (i << 10)).to_le_bytes());
-            out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-        } else if off < 0 && (-off) <= 4095 {
-            let imm12 = (-off) as u16;
-            let (i, imm3, imm8) = split_imm12(imm12);
-            out.extend_from_slice(&(0xF2AF | (i << 10)).to_le_bytes());
-            out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-        } else {
-            return Err(anyhow!("ADR offset {} out of range", off));
-        }
-        return Ok(());
-    }
-
-    // MOV / MOVW / MOVT / MVN
-    if matches!(base.as_str(), "MOV" | "MOVW" | "MOVT" | "MVN") {
-        return encode_mov(&base, setflags, wide, ops, equs, symbols, out);
-    }
-
-    // Shifts (LSL, LSR, ASR, ROR, RRX)
-    if matches!(base.as_str(), "LSL" | "LSR" | "ASR" | "ROR" | "RRX") {
-        return encode_shift(&base, setflags, wide, ops, equs, symbols, out);
-    }
-
-    // Multiply & Divide
-    if matches!(base.as_str(), "MUL" | "MLA" | "MLS" | "UDIV" | "SDIV" | "UMULL" | "SMULL") {
-        return encode_mul_div(&base, setflags, ops, out);
-    }
-
-    // Extend / Bit / Byte reverse
-    if matches!(base.as_str(), "UXTB" | "UXTH" | "SXTB" | "SXTH" | "CLZ" | "RBIT" | "REV" | "REV16" | "REVSH") {
-        return encode_misc_dp(&base, ops, out);
-    }
-
-    // Data processing (ADD, SUB, ADC, SBC, RSB, NEG, AND, ORR, ORN, EOR, BIC, CMP, CMN, TST, TEQ)
-    encode_dp(&base, setflags, wide, ops, equs, symbols, out)
-}
-
-fn encode_mov(
-    base: &str,
-    setflags: bool,
-    wide: bool,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    if ops.len() < 2 {
-        return Err(anyhow!("{} expects Rd, src", base));
-    }
-    let rd = parse_reg(&ops[0])?;
-    let src = ops[1].trim();
-
-    if base == "MOVW" || base == "MOVT" {
-        let imm = eval_imm(src, equs, symbols)? as u32;
-        if imm > 0xFFFF {
-            return Err(anyhow!("{} immediate 0x{:X} > 0xFFFF", base, imm));
-        }
-        let imm4 = ((imm >> 12) & 0xF) as u16;
-        let i = ((imm >> 11) & 1) as u16;
-        let imm3 = ((imm >> 8) & 0x7) as u16;
-        let imm8 = (imm & 0xFF) as u16;
-        let op_top = if base == "MOVT" { 0xF2C0 } else { 0xF240 };
-        out.extend_from_slice(&(op_top | (i << 10) | imm4).to_le_bytes());
-        out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-        return Ok(());
-    }
-
-    if is_imm_syntax(src) {
-        let imm = eval_imm(src, equs, symbols)? as u32;
-        if base == "MOV" {
-            if !wide && rd < 8 && imm <= 0xFF && (setflags || true) {
-                // Note: Outside IT, MOV Rd, #0..255 with Rd<8 uses 16-bit MOVS when setflags OR compact code unless MOV.W requested
-                if setflags {
-                    out.extend_from_slice(&(0x2000 | ((rd as u16) << 8) | (imm as u16)).to_le_bytes());
-                    return Ok(());
-                }
-            }
-            if let Some(imm12) = encode_thumb_expand_imm(imm) {
-                let (i, imm3, imm8) = split_imm12(imm12);
-                let s_bit = if setflags { 1u16 << 4 } else { 0 };
-                out.extend_from_slice(&(0xF04F | (i << 10) | s_bit).to_le_bytes());
-                out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-                return Ok(());
-            }
-            if imm <= 0xFFFF && !setflags {
-                let imm4 = ((imm >> 12) & 0xF) as u16;
-                let i = ((imm >> 11) & 1) as u16;
-                let imm3 = ((imm >> 8) & 0x7) as u16;
-                let imm8 = (imm & 0xFF) as u16;
-                out.extend_from_slice(&(0xF240 | (i << 10) | imm4).to_le_bytes());
-                out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-                return Ok(());
-            }
-            if rd < 8 && imm <= 0xFF {
-                out.extend_from_slice(&(0x2000 | ((rd as u16) << 8) | (imm as u16)).to_le_bytes());
-                return Ok(());
-            }
-            return Err(anyhow!("Constant 0x{:X} cannot be encoded in MOV; use LDR {}, =0x{:X} or MOVW/MOVT", imm, ops[0], imm));
-        } else {
-            // MVN
-            if let Some(imm12) = encode_thumb_expand_imm(imm) {
-                let (i, imm3, imm8) = split_imm12(imm12);
-                let s_bit = if setflags { 1u16 << 4 } else { 0 };
-                out.extend_from_slice(&(0xF06F | (i << 10) | s_bit).to_le_bytes());
-                out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-                return Ok(());
-            }
-            return Err(anyhow!("Constant 0x{:X} cannot be encoded in MVN", imm));
-        }
-    }
-
-    let rm = parse_reg(src)?;
-    if base == "MOV" {
-        if setflags && rd < 8 && rm < 8 {
-            out.extend_from_slice(&(((rm as u16) << 3) | (rd as u16)).to_le_bytes());
-        } else if !wide && !setflags {
-            let d = ((rd as u16) >> 3) & 1;
-            out.extend_from_slice(&(0x4600 | (d << 7) | ((rm as u16) << 3) | ((rd as u16) & 7)).to_le_bytes());
-        } else {
-            let s_bit = if setflags { 1u16 << 4 } else { 0 };
-            out.extend_from_slice(&(0xEA4F | s_bit).to_le_bytes());
-            out.extend_from_slice(&(((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-    } else {
-        if rd < 8 && rm < 8 && setflags {
-            out.extend_from_slice(&(0x43C0 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes());
-        } else {
-            let s_bit = if setflags { 1u16 << 4 } else { 0 };
-            out.extend_from_slice(&(0xEA6F | s_bit).to_le_bytes());
-            out.extend_from_slice(&(((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-    }
-    Ok(())
-}
-
-fn encode_shift(
-    base: &str,
-    setflags: bool,
-    wide: bool,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let rd = parse_reg(ops.first().ok_or_else(|| anyhow!("Missing Rd"))?)?;
-    if base == "RRX" {
-        let rm = parse_reg(ops.get(1).ok_or_else(|| anyhow!("Missing Rm"))?)?;
-        let s_bit = if setflags { 1u16 << 4 } else { 0 };
-        out.extend_from_slice(&(0xEA4F | s_bit).to_le_bytes());
-        out.extend_from_slice(&(((rd as u16) << 8) | 0x0030 | (rm as u16)).to_le_bytes());
-        return Ok(());
-    }
-    let (rn, sh_op) = if ops.len() >= 3 {
-        (parse_reg(&ops[1])?, ops[2].trim())
-    } else if ops.len() == 2 {
-        (rd, ops[1].trim())
-    } else {
-        return Err(anyhow!("{} expects Rd, Rn, shift", base));
-    };
-
-    let stype: u16 = match base {
-        "LSL" => 0,
-        "LSR" => 1,
-        "ASR" => 2,
-        "ROR" => 3,
-        _ => 0,
-    };
-
-    if is_imm_syntax(sh_op) {
-        let amt = eval_imm(sh_op, equs, symbols)? as u32;
-        if stype < 3 && !wide && setflags && rd < 8 && rn < 8 && amt <= 32 {
-            let imm5 = if amt == 32 && stype > 0 { 0 } else { (amt & 0x1F) as u16 };
-            out.extend_from_slice(&((stype << 11) | (imm5 << 6) | ((rn as u16) << 3) | (rd as u16)).to_le_bytes());
-            return Ok(());
-        }
-        let imm5 = if amt == 32 && (stype == 1 || stype == 2) { 0u16 } else { (amt & 0x1F) as u16 };
-        let imm3 = (imm5 >> 2) & 0x7;
-        let imm2 = imm5 & 0x3;
-        let s_bit = if setflags { 1u16 << 4 } else { 0 };
-        out.extend_from_slice(&(0xEA4F | s_bit).to_le_bytes());
-        out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | (imm2 << 6) | (stype << 4) | (rn as u16)).to_le_bytes());
-        return Ok(());
-    }
-
-    let rm = parse_reg(sh_op)?;
-    if !wide && setflags && rd == rn && rd < 8 && rm < 8 {
-        let alu = match stype { 0 => 2, 1 => 3, 2 => 4, _ => 7 };
-        out.extend_from_slice(&(0x4000 | (alu << 6) | ((rm as u16) << 3) | (rd as u16)).to_le_bytes());
-    } else {
-        let s_bit = if setflags { 1u16 << 4 } else { 0 };
-        out.extend_from_slice(&(0xFA00 | (stype << 5) | s_bit | (rn as u16)).to_le_bytes());
-        out.extend_from_slice(&(0xF000 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-    }
-    Ok(())
-}
-
-fn encode_mul_div(base: &str, setflags: bool, ops: &[String], out: &mut Vec<u8>) -> Result<()> {
-    match base {
-        "MUL" => {
-            let (rd, rn, rm) = if ops.len() >= 3 {
-                (parse_reg(&ops[0])?, parse_reg(&ops[1])?, parse_reg(&ops[2])?)
-            } else {
-                let r = parse_reg(&ops[0])?;
-                (r, parse_reg(&ops[1])?, r)
-            };
-            if setflags && rd < 8 && rn < 8 && (rd == rn || rd == rm) {
-                let other = if rd == rn { rm } else { rn };
-                out.extend_from_slice(&(0x4340 | ((other as u16) << 3) | (rd as u16)).to_le_bytes());
-            } else {
-                out.extend_from_slice(&(0xFB00 | (rn as u16)).to_le_bytes());
-                out.extend_from_slice(&(0xF000 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-            }
-        }
-        "MLA" | "MLS" => {
-            if ops.len() < 4 { return Err(anyhow!("{} expects Rd, Rn, Rm, Ra", base)); }
-            let rd = parse_reg(&ops[0])?;
-            let rn = parse_reg(&ops[1])?;
-            let rm = parse_reg(&ops[2])?;
-            let ra = parse_reg(&ops[3])?;
-            let op2 = if base == "MLS" { 0x10 } else { 0x00 };
-            out.extend_from_slice(&(0xFB00 | (rn as u16)).to_le_bytes());
-            out.extend_from_slice(&(((ra as u16) << 12) | ((rd as u16) << 8) | op2 | (rm as u16)).to_le_bytes());
-        }
-        "SDIV" | "UDIV" => {
-            let (rd, rn, rm) = if ops.len() >= 3 {
-                (parse_reg(&ops[0])?, parse_reg(&ops[1])?, parse_reg(&ops[2])?)
-            } else {
-                let r = parse_reg(&ops[0])?;
-                (r, r, parse_reg(&ops[1])?)
-            };
-            let op1 = if base == "UDIV" { 0xFBB0 } else { 0xFB90 };
-            out.extend_from_slice(&(op1 | (rn as u16)).to_le_bytes());
-            out.extend_from_slice(&(0xF0F0 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-        "SMULL" | "UMULL" => {
-            if ops.len() < 4 { return Err(anyhow!("{} expects RdLo, RdHi, Rn, Rm", base)); }
-            let rdlo = parse_reg(&ops[0])?;
-            let rdhi = parse_reg(&ops[1])?;
-            let rn = parse_reg(&ops[2])?;
-            let rm = parse_reg(&ops[3])?;
-            let op1 = if base == "UMULL" { 0xFBA0 } else { 0xFB80 };
-            out.extend_from_slice(&(op1 | (rn as u16)).to_le_bytes());
-            out.extend_from_slice(&(((rdlo as u16) << 12) | ((rdhi as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn encode_misc_dp(base: &str, ops: &[String], out: &mut Vec<u8>) -> Result<()> {
-    if ops.len() < 2 { return Err(anyhow!("{} expects Rd, Rm", base)); }
-    let rd = parse_reg(&ops[0])?;
-    let rm = parse_reg(&ops[1])?;
-    if rd < 8 && rm < 8 {
-        match base {
-            "SXTH" => { out.extend_from_slice(&(0xB200 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "SXTB" => { out.extend_from_slice(&(0xB240 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "UXTH" => { out.extend_from_slice(&(0xB280 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "UXTB" => { out.extend_from_slice(&(0xB2C0 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "REV"  => { out.extend_from_slice(&(0xBA00 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "REV16"=> { out.extend_from_slice(&(0xBA40 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            "REVSH"=> { out.extend_from_slice(&(0xBAC0 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes()); return Ok(()); }
-            _ => {}
-        }
-    }
-    match base {
-        "CLZ" => {
-            out.extend_from_slice(&(0xFAB0 | (rm as u16)).to_le_bytes());
-            out.extend_from_slice(&(0xF080 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-        "RBIT" => {
-            out.extend_from_slice(&(0xFA90 | (rm as u16)).to_le_bytes());
-            out.extend_from_slice(&(0xF0A0 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-        "SXTH" | "UXTH" | "SXTB" | "UXTB" => {
-            let op: u16 = match base { "SXTH" => 0xFA0F, "UXTH" => 0xFA1F, "SXTB" => 0xFA4F, _ => 0xFA5F };
-            out.extend_from_slice(&op.to_le_bytes());
-            out.extend_from_slice(&(0xF080 | ((rd as u16) << 8) | (rm as u16)).to_le_bytes());
-        }
-        _ => {
-            let op2 = match base { "REV" => 0x80, "REV16" => 0x90, _ => 0xB0 };
-            out.extend_from_slice(&(0xFA90 | (rm as u16)).to_le_bytes());
-            out.extend_from_slice(&(0xF000 | ((rd as u16) << 8) | op2 | (rm as u16)).to_le_bytes());
-        }
-    }
-    Ok(())
-}
-
-fn encode_dp(
-    base: &str,
-    setflags: bool,
-    wide: bool,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    out: &mut Vec<u8>,
-) -> Result<()> {
-    let is_cmp_style = matches!(base, "CMP" | "CMN" | "TST" | "TEQ");
-    let (rd, rn, rhs, extra_shift) = if is_cmp_style {
-        if ops.len() < 2 { return Err(anyhow!("{} expects Rn, op2", base)); }
-        let rn = parse_reg(&ops[0])?;
-        let sh = ops.get(2).map(|s| s.as_str());
-        (15usize, rn, ops[1].trim(), sh)
-    } else if base == "NEG" {
-        if ops.len() < 2 { return Err(anyhow!("NEG expects Rd, Rm")); }
-        let rd = parse_reg(&ops[0])?;
-        let rm = parse_reg(&ops[1])?;
-        if rd < 8 && rm < 8 && setflags {
-            out.extend_from_slice(&(0x4240 | ((rm as u16) << 3) | (rd as u16)).to_le_bytes());
-        } else {
-            let s_bit = if setflags { 1u16 << 4 } else { 0 };
-            out.extend_from_slice(&(0xF1C0 | s_bit | (rm as u16)).to_le_bytes());
-            out.extend_from_slice(&(((rd as u16) << 8)).to_le_bytes());
-        }
-        return Ok(());
-    } else if ops.len() == 2 {
-        let rd = parse_reg(&ops[0])?;
-        (rd, rd, ops[1].trim(), None)
-    } else if ops.len() >= 3 {
-        let rd = parse_reg(&ops[0])?;
-        let rn = parse_reg(&ops[1])?;
-        let sh = ops.get(3).map(|s| s.as_str());
-        (rd, rn, ops[2].trim(), sh)
-    } else {
-        return Err(anyhow!("{} expects at least 2 operands", base));
-    };
-
-    let op_code: u16 = match base {
-        "AND" | "TST" => 0x0,
-        "BIC" => 0x1,
-        "ORR" => 0x2,
-        "ORN" => 0x3,
-        "EOR" | "TEQ" => 0x4,
-        "ADD" | "CMN" => 0x8,
-        "ADC" => 0xA,
-        "SBC" => 0xB,
-        "SUB" | "CMP" => 0xD,
-        "RSB" => 0xE,
-        _ => return Err(anyhow!("Unsupported instruction '{}'", base)),
-    };
-
-    if is_imm_syntax(rhs) && extra_shift.is_none() {
-        let imm = eval_imm(rhs, equs, symbols)? as u32;
-
-        // Compact 16-bit forms
-        if !wide {
-            if base == "CMP" && rn < 8 && imm <= 0xFF {
-                out.extend_from_slice(&(0x2800 | ((rn as u16) << 8) | (imm as u16)).to_le_bytes());
-                return Ok(());
-            }
-            if (base == "ADD" || base == "SUB") && rd == 13 && rn == 13 && (imm & 3) == 0 && imm <= 508 {
-                let neg = if base == "SUB" { 1u16 << 7 } else { 0 };
-                out.extend_from_slice(&(0xB000 | neg | ((imm >> 2) as u16)).to_le_bytes());
-                return Ok(());
-            }
-            if base == "ADD" && rd < 8 && rn == 13 && (imm & 3) == 0 && imm <= 1020 {
-                out.extend_from_slice(&(0xA800 | ((rd as u16) << 8) | ((imm >> 2) as u16)).to_le_bytes());
-                return Ok(());
-            }
-            if (base == "ADD" || base == "SUB") && setflags && rd < 8 && rn < 8 {
-                if imm <= 7 {
-                    let sub_bit = if base == "SUB" { 1u16 << 9 } else { 0 };
-                    out.extend_from_slice(&(0x1C00 | sub_bit | ((imm as u16) << 6) | ((rn as u16) << 3) | (rd as u16)).to_le_bytes());
-                    return Ok(());
-                }
-                if rd == rn && imm <= 0xFF {
-                    let top = if base == "ADD" { 0x3000 } else { 0x3800 };
-                    out.extend_from_slice(&(top | ((rd as u16) << 8) | (imm as u16)).to_le_bytes());
-                    return Ok(());
-                }
-            }
-        }
-
-        // Thumb-2 modified immediate
-        if let Some(imm12) = encode_thumb_expand_imm(imm) {
-            let (i, imm3, imm8) = split_imm12(imm12);
-            let s_bit = if setflags || is_cmp_style { 1u16 << 4 } else { 0 };
-            out.extend_from_slice(&(0xF000 | (i << 10) | (op_code << 5) | s_bit | (rn as u16)).to_le_bytes());
-            out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-            return Ok(());
-        }
-
-        // ADDW / SUBW (12-bit plain immediate when flags not updated)
-        if (base == "ADD" || base == "SUB") && !setflags && imm <= 4095 {
-            let (i, imm3, imm8) = split_imm12(imm as u16);
-            let op_top = if base == "ADD" { 0xF200 } else { 0xF2A0 };
-            out.extend_from_slice(&(op_top | (i << 10) | (rn as u16)).to_le_bytes());
-            out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | imm8).to_le_bytes());
-            return Ok(());
-        }
-
-        return Err(anyhow!("Immediate 0x{:X} cannot be encoded for {}", imm, base));
-    }
-
-    // Register (+ optional shift)
-    let rm = parse_reg(rhs)?;
-    let (stype, sh_amt) = if let Some(sh) = extra_shift {
-        parse_inline_shift(sh, equs, symbols)?
-    } else {
-        (0u16, 0u16)
-    };
-
-    if !wide && extra_shift.is_none() {
-        if base == "CMP" && (rn >= 8 || rm >= 8) {
-            let n = ((rn as u16) >> 3) & 1;
-            out.extend_from_slice(&(0x4500 | (n << 7) | ((rm as u16) << 3) | ((rn as u16) & 7)).to_le_bytes());
-            return Ok(());
-        }
-        if base == "ADD" && !setflags && (rd >= 8 || rn >= 8 || rm >= 8) && rd == rn {
-            let d = ((rd as u16) >> 3) & 1;
-            out.extend_from_slice(&(0x4400 | (d << 7) | ((rm as u16) << 3) | ((rd as u16) & 7)).to_le_bytes());
-            return Ok(());
-        }
-        if setflags && (base == "ADD" || base == "SUB") && rd < 8 && rn < 8 && rm < 8 {
-            let sub_bit = if base == "SUB" { 1u16 << 9 } else { 0 };
-            out.extend_from_slice(&(0x1800 | sub_bit | ((rm as u16) << 6) | ((rn as u16) << 3) | (rd as u16)).to_le_bytes());
-            return Ok(());
-        }
-        if is_cmp_style && rn < 8 && rm < 8 {
-            let alu = match base { "TST" => 8, "CMP" => 10, _ => 11 };
-            out.extend_from_slice(&(0x4000 | (alu << 6) | ((rm as u16) << 3) | (rn as u16)).to_le_bytes());
-            return Ok(());
-        }
-        if setflags && rd == rn && rd < 8 && rm < 8 {
-            let alu = match base {
-                "AND" => Some(0), "EOR" => Some(1), "ADC" => Some(5),
-                "SBC" => Some(6), "ORR" => Some(12), "BIC" => Some(14),
-                _ => None,
-            };
-            if let Some(a) = alu {
-                out.extend_from_slice(&(0x4000 | (a << 6) | ((rm as u16) << 3) | (rd as u16)).to_le_bytes());
-                return Ok(());
-            }
-        }
-    }
-
-    let imm3 = (sh_amt >> 2) & 0x7;
-    let imm2 = sh_amt & 0x3;
-    let s_bit = if setflags || is_cmp_style { 1u16 << 4 } else { 0 };
-    out.extend_from_slice(&(0xEA00 | (op_code << 5) | s_bit | (rn as u16)).to_le_bytes());
-    out.extend_from_slice(&((imm3 << 12) | ((rd as u16) << 8) | (imm2 << 6) | (stype << 4) | (rm as u16)).to_le_bytes());
-    Ok(())
-}
-
-fn encode_ldst(
-    pc: u32,
-    base: &str,
-    ops: &[String],
-    equs: &HashMap<String, i64>,
-    symbols: &HashMap<String, SymEntry>,
-    literals: &[LiteralEntry],
-    lit_cursor: &mut usize,
-    out: &mut Vec<u8>,
-    sizing_only: bool,
-) -> Result<()> {
-    if ops.len() < 2 {
-        return Err(anyhow!("{} expects Rt, [address]", base));
-    }
-    let rt = parse_reg(&ops[0])?;
-    let rest = ops[1..].join(",").trim().to_string();
-
-    // Literal pool: LDR Rt, =expr
-    if base == "LDR" && rest.starts_with('=') {
-        let lit_addr = literals
-            .get(*lit_cursor)
-            .map(|l| l.addr)
-            .unwrap_or(pc + 4);
-        if !sizing_only {
-            *lit_cursor += 1;
-        }
-        let base_pc = (pc + 4) & !3;
-        let off = (lit_addr as i64) - (base_pc as i64);
-        let u_bit = if off >= 0 { 1u16 << 7 } else { 0 };
-        let abs_off = off.unsigned_abs() as u16 & 0xFFF;
-        out.extend_from_slice(&(0xF85F | u_bit).to_le_bytes());
-        out.extend_from_slice(&(((rt as u16) << 12) | abs_off).to_le_bytes());
-        return Ok(());
-    }
-
-    // Label PC-relative: LDR Rt, label
-    if !rest.starts_with('[') {
-        let target = if sizing_only { pc + 4 } else { eval_branch_target(&rest, equs, symbols)? };
-        let base_pc = (pc + 4) & !3;
-        let off = (target as i64) - (base_pc as i64);
-        if off >= 0 && (off & 3) == 0 && off <= 1020 && rt < 8 && base == "LDR" {
-            out.extend_from_slice(&(0x4800 | ((rt as u16) << 8) | ((off >> 2) as u16)).to_le_bytes());
-            return Ok(());
-        }
-        let u_bit = if off >= 0 { 1u16 << 7 } else { 0 };
-        let abs_off = off.unsigned_abs() as u16 & 0xFFF;
-        out.extend_from_slice(&(0xF85F | u_bit).to_le_bytes());
-        out.extend_from_slice(&(((rt as u16) << 12) | abs_off).to_le_bytes());
-        return Ok(());
-    }
-
-    // Parse [Rn, ...] (+ optional post-index , #imm)
-    let is_load = base.starts_with("LDR");
-    let is_signed = base.contains('S');
-    let size_bits: u16 = if base.ends_with('B') { 0 } else if base.ends_with('H') { 1 } else { 2 };
-
-    let close_br = rest.find(']').ok_or_else(|| anyhow!("Missing ']' in {}", rest))?;
-    let inside = rest[1..close_br].trim();
-    let after = rest[close_br + 1..].trim();
-    let pre_wb = after.starts_with('!');
-    let post_imm_str = if after.starts_with(',') { Some(after[1..].trim()) } else { None };
-
-    let inner_parts = split_operands(inside);
-    let rn = parse_reg(&inner_parts[0])?;
-
-    if let Some(pimm_s) = post_imm_str {
-        // Post-indexed: [Rn], #imm
-        let imm = eval_imm(pimm_s, equs, symbols)?;
-        let u_bit = if imm >= 0 { 1u16 << 9 } else { 0 };
-        let abs = imm.unsigned_abs() as u16 & 0xFF;
-        let l_bit = if is_load { 1u16 << 4 } else { 0 };
-        let s_bit = if is_signed { 1u16 << 8 } else { 0 };
-        let hw1 = 0xF800 | s_bit | (size_bits << 5) | l_bit | (rn as u16);
-        let hw2 = ((rt as u16) << 12) | 0x0900 | u_bit | abs; // P=0, W=1
-        out.extend_from_slice(&hw1.to_le_bytes());
-        out.extend_from_slice(&hw2.to_le_bytes());
-        return Ok(());
-    }
-
-    if inner_parts.len() == 1 || is_imm_syntax(&inner_parts[1]) {
-        let imm = if inner_parts.len() >= 2 {
-            eval_imm(&inner_parts[1], equs, symbols)?
-        } else {
-            0
-        };
-
-        // Compact 16-bit forms when no writeback and non-negative
-        if !pre_wb && imm >= 0 && !is_signed {
-            if size_bits == 2 && rn == 13 && rt < 8 && (imm & 3) == 0 && imm <= 1020 {
-                let op = if is_load { 0x9800 } else { 0x9000 };
-                out.extend_from_slice(&(op | ((rt as u16) << 8) | ((imm >> 2) as u16)).to_le_bytes());
-                return Ok(());
-            }
-            if rt < 8 && rn < 8 {
-                let shift = size_bits as i64;
-                let max_imm = 31i64 << shift;
-                if (imm & ((1 << shift) - 1)) == 0 && imm <= max_imm {
-                    let top = match (size_bits, is_load) {
-                        (2, false) => 0x6000,
-                        (2, true)  => 0x6800,
-                        (0, false) => 0x7000,
-                        (0, true)  => 0x7800,
-                        (1, false) => 0x8000,
-                        _          => 0x8800,
-                    };
-                    out.extend_from_slice(&(top | (((imm >> shift) as u16) << 6) | ((rn as u16) << 3) | (rt as u16)).to_le_bytes());
-                    return Ok(());
-                }
-            }
-        }
-
-        let l_bit = if is_load { 1u16 << 4 } else { 0 };
-        let s_bit = if is_signed { 1u16 << 8 } else { 0 };
-        if !pre_wb && imm >= 0 && imm <= 4095 {
-            let hw1 = 0xF880 | s_bit | (size_bits << 5) | l_bit | (rn as u16);
-            let hw2 = ((rt as u16) << 12) | (imm as u16);
-            out.extend_from_slice(&hw1.to_le_bytes());
-            out.extend_from_slice(&hw2.to_le_bytes());
-        } else {
-            let u_bit = if imm >= 0 { 1u16 << 9 } else { 0 };
-            let w_bit = if pre_wb { 1u16 << 8 } else { 0 };
-            let abs = imm.unsigned_abs() as u16 & 0xFF;
-            let hw1 = 0xF800 | s_bit | (size_bits << 5) | l_bit | (rn as u16);
-            let hw2 = ((rt as u16) << 12) | 0x0C00 | u_bit | w_bit | abs;
-            out.extend_from_slice(&hw1.to_le_bytes());
-            out.extend_from_slice(&hw2.to_le_bytes());
-        }
-        return Ok(());
-    }
-
-    // Register offset: [Rn, Rm(, LSL #n)]
-    let rm = parse_reg(&inner_parts[1])?;
-    let shift = if inner_parts.len() >= 3 {
-        let (_, a) = parse_inline_shift(&inner_parts[2], equs, symbols)?;
-        a & 3
-    } else {
-        0
-    };
-    if shift == 0 && rt < 8 && rn < 8 && rm < 8 {
-        let sub = match (is_load, size_bits, is_signed) {
-            (false, 2, _) => 0,
-            (false, 1, _) => 1,
-            (false, 0, _) => 2,
-            (true, 0, true) => 3,
-            (true, 2, _) => 4,
-            (true, 1, false) => 5,
-            (true, 0, false) => 6,
-            _ => 7,
-        };
-        out.extend_from_slice(&(0x5000 | (sub << 9) | ((rm as u16) << 6) | ((rn as u16) << 3) | (rt as u16)).to_le_bytes());
-    } else {
-        let l_bit = if is_load { 1u16 << 4 } else { 0 };
-        let s_bit = if is_signed { 1u16 << 8 } else { 0 };
-        let hw1 = 0xF800 | s_bit | (size_bits << 5) | l_bit | (rn as u16);
-        let hw2 = ((rt as u16) << 12) | (shift << 4) | (rm as u16);
-        out.extend_from_slice(&hw1.to_le_bytes());
-        out.extend_from_slice(&hw2.to_le_bytes());
-    }
-    Ok(())
-}
-
-// ---- Encoding & Expression Helpers ----
-
-fn parse_mnemonic(raw: &str) -> (String, bool, bool, Option<u8>) {
-    let mut s = raw.to_ascii_uppercase();
-    let mut wide = false;
-    if let Some(stem) = s.strip_suffix(".W") {
-        wide = true;
-        s = stem.to_string();
-    } else if let Some(stem) = s.strip_suffix(".N") {
-        s = stem.to_string();
-    }
-
-    // Condition check on B<cond>
-    if s.len() == 3 && s.starts_with('B') {
-        if let Some(c) = parse_cond(&s[1..]) {
-            return ("B".to_string(), false, wide, Some(c));
-        }
-    }
-
-    // Check explicit 'S' suffix on ALU mnemonics
-    let base_candidates = [
-        "MOVS", "MVNS", "ADDS", "ADCS", "SUBS", "SBCS", "RSBS", "ANDS", "ORRS",
-        "ORNS", "EORS", "BICS", "LSLS", "LSRS", "ASRS", "RORS", "MULS",
-    ];
-    if base_candidates.contains(&s.as_str()) {
-        return (s[..s.len() - 1].to_string(), true, wide, None);
-    }
-
-    (s, false, wide, None)
-}
-
-fn parse_cond(c: &str) -> Option<u8> {
-    match c {
-        "EQ" => Some(0),
-        "NE" => Some(1),
-        "CS" | "HS" => Some(2),
-        "CC" | "LO" => Some(3),
-        "MI" => Some(4),
-        "PL" => Some(5),
-        "VS" => Some(6),
-        "VC" => Some(7),
-        "HI" => Some(8),
-        "LS" => Some(9),
-        "GE" => Some(10),
-        "LT" => Some(11),
-        "GT" => Some(12),
-        "LE" => Some(13),
-        "AL" => Some(14),
-        _ => None,
-    }
-}
-
-fn encode_t32_bcond(cond: u8, off: i32) -> (u16, u16) {
-    let v = (off >> 1) as u32;
-    let s = ((v >> 19) & 1) as u16;
-    let j2 = ((v >> 18) & 1) as u16;
-    let j1 = ((v >> 17) & 1) as u16;
-    let imm6 = ((v >> 11) & 0x3F) as u16;
-    let imm11 = (v & 0x7FF) as u16;
-    let hw1 = 0xF000 | (s << 10) | ((cond as u16) << 6) | imm6;
-    let hw2 = 0x8000 | (j1 << 13) | (j2 << 11) | imm11;
-    (hw1, hw2)
-}
-
-fn encode_t32_b_bl(off: i32, is_bl: bool) -> (u16, u16) {
-    let v = (off >> 1) as u32;
-    let s = ((v >> 23) & 1) as u16;
-    let i1 = ((v >> 22) & 1) as u16;
-    let i2 = ((v >> 21) & 1) as u16;
-    let j1 = (!(i1 ^ s)) & 1;
-    let j2 = (!(i2 ^ s)) & 1;
-    let imm10 = ((v >> 11) & 0x3FF) as u16;
-    let imm11 = (v & 0x7FF) as u16;
-    let hw1 = 0xF000 | (s << 10) | imm10;
-    let bl_bit = if is_bl { 1u16 << 14 } else { 0 };
-    let hw2 = 0x9000 | bl_bit | (j1 << 13) | (j2 << 11) | imm11;
-    (hw1, hw2)
-}
-
-pub fn encode_thumb_expand_imm(val: u32) -> Option<u16> {
-    if (val & 0xFFFF_FF00) == 0 {
-        return Some(val as u16);
-    }
-    let b0 = val & 0xFF;
-    if val == ((b0 << 16) | b0) {
-        return Some(0x100 | (b0 as u16));
-    }
-    let b1 = (val >> 8) & 0xFF;
-    if val == ((b1 << 24) | (b1 << 8)) {
-        return Some(0x200 | (b1 as u16));
-    }
-    if val == ((b0 << 24) | (b0 << 16) | (b0 << 8) | b0) {
-        return Some(0x300 | (b0 as u16));
-    }
-    for rot in 8..32u32 {
-        let u = val.rotate_left(rot);
-        if (u & !0xFF) == 0 && (u & 0x80) != 0 {
-            let enc = ((rot as u16) << 7) | ((u & 0x7F) as u16);
-            let (check, _) = thumb_expand_imm_c(enc as u32, false);
-            if check == val {
-                return Some(enc);
-            }
-        }
-    }
-    None
-}
-
-#[inline]
-fn split_imm12(imm12: u16) -> (u16, u16, u16) {
-    ((imm12 >> 11) & 1, (imm12 >> 8) & 7, imm12 & 0xFF)
-}
-
-fn parse_inline_shift(s: &str, equs: &HashMap<String, i64>, symbols: &HashMap<String, SymEntry>) -> Result<(u16, u16)> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok((0, 0));
-    }
-    let kind = parts[0].to_ascii_uppercase();
-    let stype = match kind.as_str() {
-        "LSL" => 0,
-        "LSR" => 1,
-        "ASR" => 2,
-        "ROR" => 3,
-        "RRX" => return Ok((3, 0)),
-        _ => return Err(anyhow!("Unknown shift '{}'", s)),
-    };
-    let amt = if parts.len() >= 2 {
-        eval_imm(parts[1], equs, symbols)? as u16
-    } else {
-        0
-    };
-    Ok((stype, amt))
-}
-
-fn parse_reg(s: &str) -> Result<usize> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "R0" | "A1" => Ok(0),
-        "R1" | "A2" => Ok(1),
-        "R2" | "A3" => Ok(2),
-        "R3" | "A4" => Ok(3),
-        "R4" | "V1" => Ok(4),
-        "R5" | "V2" => Ok(5),
-        "R6" | "V3" => Ok(6),
-        "R7" | "V4" => Ok(7),
-        "R8" | "V5" => Ok(8),
-        "R9" | "V6" => Ok(9),
-        "R10" | "V7" => Ok(10),
-        "R11" | "V8" | "FP" => Ok(11),
-        "R12" | "IP" => Ok(12),
-        "R13" | "SP" => Ok(13),
-        "R14" | "LR" => Ok(14),
-        "R15" | "PC" => Ok(15),
-        _ => Err(anyhow!("Unknown register '{}'", s.trim())),
-    }
-}
-
-fn parse_reg_list(s: &str) -> Result<u16> {
-    let trimmed = s.trim().trim_start_matches('{').trim_end_matches('}');
-    let mut mask = 0u16;
-    for tok in trimmed.split(',') {
-        let t = tok.trim();
-        if t.is_empty() { continue; }
-        if let Some((a, b)) = t.split_once('-') {
-            let r1 = parse_reg(a)?;
-            let r2 = parse_reg(b)?;
-            for r in r1..=r2 {
-                mask |= 1u16 << r;
-            }
-        } else {
-            let r = parse_reg(t)?;
-            mask |= 1u16 << r;
-        }
-    }
-    Ok(mask)
-}
-
-fn is_imm_syntax(s: &str) -> bool {
-    let t = s.trim();
-    t.starts_with('#') || t.chars().next().map(|c| c.is_ascii_digit() || c == '-').unwrap_or(false)
-}
-
-fn eval_imm(s: &str, equs: &HashMap<String, i64>, symbols: &HashMap<String, SymEntry>) -> Result<i64> {
-    let t = s.trim().strip_prefix('#').unwrap_or(s.trim()).trim();
-    eval_expr(t, equs, symbols)
-}
-
-fn eval_expr_for_data(s: &str, equs: &HashMap<String, i64>, symbols: &HashMap<String, SymEntry>) -> Result<u32> {
-    let t = s.trim();
-    if let Some(sym) = symbols.get(t) {
-        return Ok(if sym.is_func { sym.addr | 1 } else { sym.addr });
-    }
-    Ok(eval_expr(t, equs, symbols)? as u32)
-}
-
-fn eval_branch_target(s: &str, equs: &HashMap<String, i64>, symbols: &HashMap<String, SymEntry>) -> Result<u32> {
-    let t = s.trim();
-    if let Some(sym) = symbols.get(t) {
-        return Ok(sym.addr & !1);
-    }
-    // Case-insensitive lookup fallback
-    if let Some((_, sym)) = symbols.iter().find(|(k, _)| k.eq_ignore_ascii_case(t)) {
-        return Ok(sym.addr & !1);
-    }
-    Ok((eval_expr(t, equs, symbols)? as u32) & !1)
-}
-
-fn eval_expr(s: &str, equs: &HashMap<String, i64>, symbols: &HashMap<String, SymEntry>) -> Result<i64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Err(anyhow!("Empty expression"));
-    }
-    // Simple bitwise/arithmetic evaluation (low to high precedence: |, &, << >>, + -, * /)
-    for op in ["|", "^", "&", "<<", ">>", "+", "-"] {
-        if let Some(pos) = find_top_level_op(t, op) {
-            if pos == 0 && (op == "-" || op == "+") {
-                let rhs = eval_expr(&t[1..], equs, symbols)?;
-                return Ok(if op == "-" { -rhs } else { rhs });
-            }
-            let lhs = eval_expr(&t[..pos], equs, symbols)?;
-            let rhs = eval_expr(&t[pos + op.len()..], equs, symbols)?;
-            return Ok(match op {
-                "|" => lhs | rhs,
-                "^" => lhs ^ rhs,
-                "&" => lhs & rhs,
-                "<<" => lhs.wrapping_shl(rhs as u32),
-                ">>" => lhs.wrapping_shr(rhs as u32),
-                "+" => lhs.wrapping_add(rhs),
-                "-" => lhs.wrapping_sub(rhs),
-                _ => 0,
-            });
-        }
-    }
-    for op in ["*", "/"] {
-        if let Some(pos) = find_top_level_op(t, op) {
-            let lhs = eval_expr(&t[..pos], equs, symbols)?;
-            let rhs = eval_expr(&t[pos + 1..], equs, symbols)?;
-            return Ok(if op == "*" { lhs.wrapping_mul(rhs) } else if rhs != 0 { lhs / rhs } else { 0 });
-        }
-    }
-    if t.starts_with('(') && t.ends_with(')') {
-        return eval_expr(&t[1..t.len() - 1], equs, symbols);
-    }
-    if t.starts_with('\'') && t.ends_with('\'') && t.len() == 3 {
-        return Ok(t.as_bytes()[1] as i64);
-    }
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).or_else(|| t.strip_prefix('&')) {
-        return u64::from_str_radix(hex, 16)
-            .map(|v| v as i64)
-            .map_err(|_| anyhow!("Invalid hex literal '{}'", t));
-    }
-    if let Some(bin) = t.strip_prefix("2_").or_else(|| t.strip_prefix("0b")).or_else(|| t.strip_prefix("0B")) {
-        return u64::from_str_radix(bin, 2)
-            .map(|v| v as i64)
-            .map_err(|_| anyhow!("Invalid binary literal '{}'", t));
-    }
-    if let Ok(num) = t.parse::<i64>() {
-        return Ok(num);
-    }
-    if let Some(&v) = equs.get(t) {
-        return Ok(v);
-    }
-    if let Some(sym) = symbols.get(t) {
-        return Ok((if sym.is_func { sym.addr | 1 } else { sym.addr }) as i64);
-    }
-    Err(anyhow!("Undefined symbol or invalid constant '{}'", t))
-}
-
-fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let op_b = op.as_bytes();
-    let mut depth = 0i32;
-    let mut i = bytes.len();
-    while i > 0 {
-        i -= 1;
-        match bytes[i] {
-            b')' => depth += 1,
-            b'(' => depth -= 1,
-            _ if depth == 0 && i + op_b.len() <= bytes.len() && &bytes[i..i + op_b.len()] == op_b => {
-                // Avoid splitting inside '0x...' or unary '-' after another operator
-                if op == "-" && i > 0 && matches!(bytes[i - 1], b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'|' | b'&' | b'(') {
-                    continue;
-                }
-                return Some(i);
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' {
-            in_str = !in_str;
-        } else if !in_str {
-            if b == b';' || (b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/') {
-                return &line[..i];
-            }
-        }
-        i += 1;
-    }
-    line
-}
-
-fn try_parse_equ(line: &str) -> Option<(&str, &str)> {
-    let t = line.trim();
-    let mut parts = t.split_whitespace();
-    let name = parts.next()?;
-    let kw = parts.next()?;
-    if kw.eq_ignore_ascii_case("EQU") {
-        let idx = t.to_ascii_uppercase().find("EQU")?;
-        return Some((name, t[idx + 3..].trim()));
-    }
-    if let Some(rest) = t.strip_prefix(".equ").or_else(|| t.strip_prefix(".EQU")) {
-        if let Some((n, v)) = rest.split_once(',') {
-            return Some((n.trim(), v.trim()));
-        }
-    }
-    None
-}
-
-fn find_label_colon(s: &str) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut in_str = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'"' { in_str = !in_str; }
-        else if !in_str {
-            if b == b':' { return Some(i); }
-            if b.is_ascii_whitespace() { break; }
-        }
-    }
-    None
-}
-
-fn is_valid_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '.').unwrap_or(false)
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-}
-
-fn split_first_word(s: &str) -> (&str, &str) {
-    for (i, ch) in s.char_indices() {
-        if ch.is_whitespace() {
-            return (&s[..i], s[i..].trim());
-        }
-    }
-    (s, "")
-}
-
-fn split_operands(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut bracket = 0i32;
-    let mut brace = 0i32;
-    let mut in_str = false;
-
-    for ch in s.chars() {
-        match ch {
-            '"' => {
-                in_str = !in_str;
-                cur.push(ch);
-            }
-            '[' if !in_str => { bracket += 1; cur.push(ch); }
-            ']' if !in_str => { bracket -= 1; cur.push(ch); }
-            '{' if !in_str => { brace += 1; cur.push(ch); }
-            '}' if !in_str => { brace -= 1; cur.push(ch); }
-            ',' if !in_str && bracket == 0 && brace == 0 => {
-                if !cur.trim().is_empty() {
-                    out.push(cur.trim().to_string());
-                }
-                cur.clear();
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
-    }
-    out
-}
-
-fn count_dcb_bytes(ops: &[String]) -> u32 {
-    let mut n = 0u32;
-    for op in ops {
-        let t = op.trim();
-        if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
-            n += (t.len() - 2) as u32;
-        } else {
-            n += 1;
-        }
-    }
-    n
-}
-
-fn is_directive(up: &str) -> bool {
-    matches!(
-        up,
-        "PRESERVE8" | "REQUIRE8" | "THUMB" | "ARM" | "AREA" | "EXPORT" | "IMPORT"
-            | "EXTERN" | "ENTRY" | "END" | "ALIGN" | "LTORG" | "DCD" | "DCDU"
-            | "DCW" | "DCWU" | "DCB" | "SPACE" | "FILL" | "EQU" | "NOP" | "WFI"
-            | "WFE" | "SEV" | "DSB" | "DMB" | "ISB"
-    ) || up.starts_with('.')
-}
-
-fn is_zero_operand_mnem(up: &str) -> bool {
-    matches!(up, "NOP" | "WFI" | "WFE" | "SEV" | "DSB" | "DMB" | "ISB")
-}
-
-// ---- ELF32 + DWARF v2 + Intel HEX Emitters ----
-
-fn build_elf32(
-    entry: u32,
-    ro_base: u32,
-    ro_bytes: &[u8],
-    rw_base: u32,
-    rw_bytes: &[u8],
-    symbols: &HashMap<String, SymEntry>,
-    files: &[String],
-    line_rows: &[EmittedLine],
-) -> Vec<u8> {
-    let debug_line = build_dwarf_v2_line(files, line_rows);
-
-    let mut strtab = vec![0u8];
-    let mut symtab = Vec::new();
-    // Null ELF symbol
-    symtab.extend_from_slice(&[0u8; 16]);
-
-    let mut sorted_syms: Vec<&SymEntry> = symbols.values().collect();
-    sorted_syms.sort_by_key(|s| (s.addr, &s.name));
-    for s in sorted_syms {
-        let name_off = strtab.len() as u32;
-        strtab.extend_from_slice(s.name.as_bytes());
-        strtab.push(0);
-        let val = if s.is_func { s.addr | 1 } else { s.addr };
-        let st_info: u8 = if s.is_func { (1 << 4) | 2 } else { (1 << 4) | 1 }; // STB_GLOBAL | STT_FUNC/OBJECT
-        let st_shndx: u16 = if s.section == SectionKind::Data && !rw_bytes.is_empty() { 2 } else { 1 };
-        symtab.extend_from_slice(&name_off.to_le_bytes());
-        symtab.extend_from_slice(&val.to_le_bytes());
-        symtab.extend_from_slice(&0u32.to_le_bytes());
-        symtab.push(st_info);
-        symtab.push(0);
-        symtab.extend_from_slice(&st_shndx.to_le_bytes());
-    }
-
-    let debug_abbrev: [u8; 8] = [1, 0x11, 0, 0x10, 0x06, 0, 0, 0];
-    let mut debug_info = Vec::with_capacity(16);
-    debug_info.extend_from_slice(&12u32.to_le_bytes()); // unit_length
-    debug_info.extend_from_slice(&2u16.to_le_bytes());  // version = 2
-    debug_info.extend_from_slice(&0u32.to_le_bytes());  // debug_abbrev_offset = 0
-    debug_info.push(4);                                  // address_size = 4
-    debug_info.push(1);                                  // abbrev code = 1
-    debug_info.extend_from_slice(&0u32.to_le_bytes());  // DW_AT_stmt_list = 0
-
-    let mut shstrtab = vec![0u8];
-    let sh_text = push_cstr(&mut shstrtab, ".text");
-    let sh_data = if !rw_bytes.is_empty() { push_cstr(&mut shstrtab, ".data") } else { 0 };
-    let sh_symtab = push_cstr(&mut shstrtab, ".symtab");
-    let sh_strtab = push_cstr(&mut shstrtab, ".strtab");
-    let sh_dline = push_cstr(&mut shstrtab, ".debug_line");
-    let sh_dinfo = push_cstr(&mut shstrtab, ".debug_info");
-    let sh_dabbrev = push_cstr(&mut shstrtab, ".debug_abbrev");
-    let sh_shstrtab = push_cstr(&mut shstrtab, ".shstrtab");
-
-    let phnum: u16 = if rw_bytes.is_empty() { 1 } else { 2 };
-    let phoff: u32 = 52;
-    let data_start: u32 = phoff + (phnum as u32) * 32;
-
-    let text_off = align4(data_start);
-    let mut cur = text_off + ro_bytes.len() as u32;
-
-    let data_off = align4(cur);
-    if !rw_bytes.is_empty() {
-        cur = data_off + rw_bytes.len() as u32;
-    }
-
-    let sym_off = align4(cur);
-    cur = sym_off + symtab.len() as u32;
-
-    let str_off = align4(cur);
-    cur = str_off + strtab.len() as u32;
-
-    let dline_off = align4(cur);
-    cur = dline_off + debug_line.len() as u32;
-
-    let dinfo_off = align4(cur);
-    cur = dinfo_off + debug_info.len() as u32;
-
-    let dabbrev_off = align4(cur);
-    cur = dabbrev_off + debug_abbrev.len() as u32;
-
-    let shstr_off = align4(cur);
-    cur = shstr_off + shstrtab.len() as u32;
-
-    let shoff = align4(cur);
-    let has_data = !rw_bytes.is_empty();
-    let sym_idx: u16 = if has_data { 3 } else { 2 };
-    let str_idx: u16 = sym_idx + 1;
-    let dline_idx: u16 = str_idx + 1;
-    let dinfo_idx: u16 = dline_idx + 1;
-    let dabbrev_idx: u16 = dinfo_idx + 1;
-    let shstr_idx: u16 = dabbrev_idx + 1;
-    let shnum: u16 = shstr_idx + 1;
-
-    let mut elf = Vec::with_capacity((shoff + (shnum as u32) * 40) as usize);
-    // ELF32 Header (52 bytes)
-    elf.extend_from_slice(b"\x7FELF\x01\x01\x01\x00");
-    elf.extend_from_slice(&[0u8; 8]);
-    elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-    elf.extend_from_slice(&40u16.to_le_bytes()); // EM_ARM
-    elf.extend_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
-    elf.extend_from_slice(&entry.to_le_bytes());
-    elf.extend_from_slice(&phoff.to_le_bytes());
-    elf.extend_from_slice(&shoff.to_le_bytes());
-    elf.extend_from_slice(&0x0500_0200u32.to_le_bytes()); // EABI5 + HASENTRY
-    elf.extend_from_slice(&52u16.to_le_bytes());
-    elf.extend_from_slice(&32u16.to_le_bytes());
-    elf.extend_from_slice(&phnum.to_le_bytes());
-    elf.extend_from_slice(&40u16.to_le_bytes());
-    elf.extend_from_slice(&shnum.to_le_bytes());
-    elf.extend_from_slice(&shstr_idx.to_le_bytes());
-
-    // Program header 0: Flash
-    push_phdr(&mut elf, 1, text_off, ro_base, ro_bytes.len() as u32, ro_bytes.len() as u32, 5);
-    if has_data {
-        push_phdr(&mut elf, 1, data_off, rw_base, rw_bytes.len() as u32, rw_bytes.len() as u32, 6);
-    }
-
-    pad_to(&mut elf, text_off);
-    elf.extend_from_slice(ro_bytes);
-    if has_data {
-        pad_to(&mut elf, data_off);
-        elf.extend_from_slice(rw_bytes);
-    }
-    pad_to(&mut elf, sym_off);
-    elf.extend_from_slice(&symtab);
-    pad_to(&mut elf, str_off);
-    elf.extend_from_slice(&strtab);
-    pad_to(&mut elf, dline_off);
-    elf.extend_from_slice(&debug_line);
-    pad_to(&mut elf, dinfo_off);
-    elf.extend_from_slice(&debug_info);
-    pad_to(&mut elf, dabbrev_off);
-    elf.extend_from_slice(&debug_abbrev);
-    pad_to(&mut elf, shstr_off);
-    elf.extend_from_slice(&shstrtab);
-    pad_to(&mut elf, shoff);
-
-    // Section headers
-    elf.extend_from_slice(&[0u8; 40]); // Null
-    push_shdr(&mut elf, sh_text, 1, 6, ro_base, text_off, ro_bytes.len() as u32, 0, 0, 4, 0);
-    if has_data {
-        push_shdr(&mut elf, sh_data, 1, 3, rw_base, data_off, rw_bytes.len() as u32, 0, 0, 4, 0);
-    }
-    push_shdr(&mut elf, sh_symtab, 2, 0, 0, sym_off, symtab.len() as u32, str_idx as u32, 1, 4, 16);
-    push_shdr(&mut elf, sh_strtab, 3, 0, 0, str_off, strtab.len() as u32, 0, 0, 1, 0);
-    push_shdr(&mut elf, sh_dline, 1, 0, 0, dline_off, debug_line.len() as u32, 0, 0, 1, 0);
-    push_shdr(&mut elf, sh_dinfo, 1, 0, 0, dinfo_off, debug_info.len() as u32, 0, 0, 1, 0);
-    push_shdr(&mut elf, sh_dabbrev, 1, 0, 0, dabbrev_off, debug_abbrev.len() as u32, 0, 0, 1, 0);
-    push_shdr(&mut elf, sh_shstrtab, 3, 0, 0, shstr_off, shstrtab.len() as u32, 0, 0, 1, 0);
-
-    elf
-}
-
-fn build_dwarf_v2_line(files: &[String], rows: &[EmittedLine]) -> Vec<u8> {
-    let mut header = Vec::new();
-    header.push(2); // minimum_instruction_length
-    header.push(1); // default_is_stmt
-    header.push((-5i8) as u8); // line_base
-    header.push(14); // line_range
-    header.push(10); // opcode_base
-    header.extend_from_slice(&[0, 1, 1, 1, 1, 0, 0, 0, 1]); // standard_opcode_lengths (1..9)
-    header.push(0); // include_directories (empty)
-    for f in files {
-        header.extend_from_slice(f.as_bytes());
-        header.push(0);
-        header.push(0); // dir_index = 0
-        header.push(0); // mtime = 0
-        header.push(0); // size = 0
-    }
-    header.push(0); // end of file_names
-
-    let header_len = header.len() as u32;
-    let mut prog = Vec::new();
-    if let Some(first) = rows.first() {
-        // DW_LNE_set_address
-        prog.push(0);
-        prog.push(5);
-        prog.push(2);
-        prog.extend_from_slice(&first.addr.to_le_bytes());
-
-        let mut cur_addr = first.addr;
-        let mut cur_line: i64 = 1;
-        let mut cur_file: usize = 0;
-
-        for r in rows {
-            if r.file_idx != cur_file {
-                prog.push(4); // DW_LNS_set_file
-                write_uleb128(&mut prog, (r.file_idx + 1) as u64);
-                cur_file = r.file_idx;
-            }
-            let delta_pc = r.addr.saturating_sub(cur_addr) / 2;
-            if delta_pc > 0 {
-                prog.push(2); // DW_LNS_advance_pc
-                write_uleb128(&mut prog, delta_pc as u64);
-                cur_addr = r.addr;
-            }
-            let delta_line = (r.line as i64) - cur_line;
-            if delta_line != 0 {
-                prog.push(3); // DW_LNS_advance_line
-                write_sleb128(&mut prog, delta_line);
-                cur_line = r.line as i64;
-            }
-            prog.push(1); // DW_LNS_copy
-        }
-        prog.push(0);
-        prog.push(1);
-        prog.push(1); // DW_LNE_end_sequence
-    }
-
-    let unit_len: u32 = 2 + 4 + header_len + prog.len() as u32;
-    let mut out = Vec::with_capacity((4 + unit_len) as usize);
-    out.extend_from_slice(&unit_len.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes()); // DWARF v2
-    out.extend_from_slice(&header_len.to_le_bytes());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(&prog);
-    out
-}
-
-pub fn format_intel_hex(base_addr: u32, bytes: &[u8]) -> String {
-    let mut lines = Vec::new();
-    let mut cur_hi: Option<u16> = None;
-    for (idx, chunk) in bytes.chunks(16).enumerate() {
-        let addr = base_addr + (idx * 16) as u32;
-        let hi = (addr >> 16) as u16;
-        if cur_hi != Some(hi) {
-            cur_hi = Some(hi);
-            let rec = [0x02u8, 0x00, 0x00, 0x04, (hi >> 8) as u8, (hi & 0xFF) as u8];
-            lines.push(hex_record(&rec));
-        }
-        let lo = (addr & 0xFFFF) as u16;
-        let mut rec = Vec::with_capacity(4 + chunk.len());
-        rec.push(chunk.len() as u8);
-        rec.push((lo >> 8) as u8);
-        rec.push((lo & 0xFF) as u8);
-        rec.push(0x00);
-        rec.extend_from_slice(chunk);
-        lines.push(hex_record(&rec));
-    }
-    lines.push(":00000001FF".to_string());
-    lines.join("\r\n") + "\r\n"
-}
-
-fn hex_record(body: &[u8]) -> String {
-    let sum: u8 = body.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-    let csum = (!sum).wrapping_add(1);
-    let mut s = String::from(":");
-    for &b in body {
-        s.push_str(&format!("{:02X}", b));
-    }
-    s.push_str(&format!("{:02X}", csum));
-    s
-}
-
-fn write_uleb128(out: &mut Vec<u8>, mut val: u64) {
-    loop {
-        let mut b = (val & 0x7F) as u8;
-        val >>= 7;
-        if val != 0 {
-            b |= 0x80;
-        }
-        out.push(b);
-        if val == 0 { break; }
-    }
-}
-
-fn write_sleb128(out: &mut Vec<u8>, mut val: i64) {
-    loop {
-        let mut b = (val & 0x7F) as u8;
-        val >>= 7;
-        let done = (val == 0 && (b & 0x40) == 0) || (val == -1 && (b & 0x40) != 0);
-        if !done {
-            b |= 0x80;
-        }
-        out.push(b);
-        if done { break; }
-    }
-}
-
-fn push_cstr(buf: &mut Vec<u8>, s: &str) -> u32 {
-    let off = buf.len() as u32;
-    buf.extend_from_slice(s.as_bytes());
-    buf.push(0);
-    off
-}
-
-fn align4(v: u32) -> u32 {
-    (v + 3) & !3
-}
-
-fn pad_to(buf: &mut Vec<u8>, target: u32) {
-    while (buf.len() as u32) < target {
-        buf.push(0);
-    }
-}
-
-fn push_phdr(buf: &mut Vec<u8>, p_type: u32, off: u32, vaddr: u32, filesz: u32, memsz: u32, flags: u32) {
-    buf.extend_from_slice(&p_type.to_le_bytes());
-    buf.extend_from_slice(&off.to_le_bytes());
-    buf.extend_from_slice(&vaddr.to_le_bytes());
-    buf.extend_from_slice(&vaddr.to_le_bytes());
-    buf.extend_from_slice(&filesz.to_le_bytes());
-    buf.extend_from_slice(&memsz.to_le_bytes());
-    buf.extend_from_slice(&flags.to_le_bytes());
-    buf.extend_from_slice(&4u32.to_le_bytes());
-}
-
-fn push_shdr(
-    buf: &mut Vec<u8>,
-    name: u32,
-    sh_type: u32,
-    flags: u32,
-    addr: u32,
-    off: u32,
-    size: u32,
-    link: u32,
-    info: u32,
-    align: u32,
-    entsize: u32,
-) {
-    buf.extend_from_slice(&name.to_le_bytes());
-    buf.extend_from_slice(&sh_type.to_le_bytes());
-    buf.extend_from_slice(&flags.to_le_bytes());
-    buf.extend_from_slice(&addr.to_le_bytes());
-    buf.extend_from_slice(&off.to_le_bytes());
-    buf.extend_from_slice(&size.to_le_bytes());
-    buf.extend_from_slice(&link.to_le_bytes());
-    buf.extend_from_slice(&info.to_le_bytes());
-    buf.extend_from_slice(&align.to_le_bytes());
-    buf.extend_from_slice(&entsize.to_le_bytes());
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-    use crate::elf::LoadedElf;
-    use crate::sim::Simulator;
-    use crate::target::DebugTarget;
-    use crate::toolchain::ToolchainInfo;
-
-    #[test]
-    fn test_builtin_assemble_and_simulate() {
-        let tmp = std::env::temp_dir().join("uvcli_asm_unit_test");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let s_path = tmp.join("test_unit.s");
-        std::fs::write(
-            &s_path,
-            r#"
-    PRESERVE8
-    THUMB
-    AREA RESET, DATA, READONLY
-    EXPORT __Vectors
-__Vectors
-    DCD 0x20001000
-    DCD Reset_Handler
-    ALIGN
-    AREA MYCODE, CODE, READONLY
-    ENTRY
-    EXPORT Reset_Handler
-Reset_Handler
-    MOV R1, #0xFF000000
-    ORR R1, #0xFF0000
-    ORR R1, #0xFF00
-    MOV R2, #4
-    LSL R3, R1, #4
-    LSR R4, R1, #4
-    ASR R5, R1, R2
-    ROR R6, R1, #3
-    LDR R0, =0x12345678
-STOP
-    B STOP
-    END
-"#,
-        )
-        .unwrap();
-
-        let proj = UvProject::from_standalone_file(&s_path).unwrap();
-        let res = assemble_project(&proj).unwrap();
-        assert!(res.success, "Assemble failed: {}", res.log);
-        let axf = res.axf_path.unwrap();
-        let tc = ToolchainInfo::discover(Some(r"C:\nonexistent_keil"), None);
-        let elf = LoadedElf::load(Path::new(&axf), &tc).unwrap();
-        assert!(!elf.disassembly.is_empty(), "Built-in disassembly should be populated");
-        assert!(!elf.lines.is_empty(), "DWARF lines should be populated");
-
-        let mut sim = Simulator::new(elf, 8_000_000);
-        let st = sim.run(500, true).unwrap();
-        assert_eq!(st.registers.r[0], 0x1234_5678);
-        assert_eq!(st.registers.r[1], 0xFFFF_FF00);
-        assert_eq!(st.registers.r[2], 4);
-        assert_eq!(st.registers.r[3], 0xFFFF_F000);
-        assert_eq!(st.registers.r[4], 0x0FFF_FFF0);
-        assert_eq!(st.registers.r[5], 0xFFFF_FFF0);
-        assert_eq!(st.registers.r[6], 0x1FFF_FFE0);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-}
+#[cfg(test)]
+mod tests;
