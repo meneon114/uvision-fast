@@ -5,7 +5,8 @@ import { setSearch } from '../../lib/nav';
 import { useProjectSearch } from '../../lib/useProjectSearch';
 import { refreshMemory } from '../../state/ide';
 import { ide, useIde } from '../../state/store';
-import { TbButton } from '../shell/TbButton';
+import { TbButton, TbSize } from '../shell/TbButton';
+import { Out } from './Out';
 import { BuildOutput } from './BuildOutput';
 import { CommandWindow } from './CommandWindow';
 import { FindResults } from './FindResults';
@@ -36,7 +37,7 @@ export function BottomPanel() {
   const active: PanelId = search.panel && tabs.includes(search.panel) ? search.panel : fallback;
 
   return (
-    <section className="panel" aria-label="Panel">
+    <section className="flex-1 flex flex-col min-h-0 bg-bg" aria-label="Panel">
       <Tabs
         value={active}
         onValueChange={(v) => {
@@ -44,23 +45,29 @@ export function BottomPanel() {
           setSearch({ panel: v as PanelId }, true);
           if (v.startsWith('mem')) void refreshMemory(Number(v.slice(3)) - 1);
         }}
-        className="ptabs-root"
+        className="flex-1 flex flex-col min-h-0"
       >
-        <div className="ptabs">
-          <TabsList aria-label="Panel windows" className="ptabs-list">
+        <div className="h-8.75 flex items-center gap-1 pl-2.5 pr-2 flex-none">
+          <TabsList aria-label="Panel windows" className="h-full min-w-0 border-0 overflow-x-auto no-scrollbar">
             {tabs.map((t) => (
-              <TabsTab key={t} value={t} className="ptab">
+              <TabsTab
+                key={t}
+                value={t}
+                className="h-full m-0 px-2 border-b border-transparent text-muted text-2xs font-normal tracking-[0.03em] uppercase whitespace-nowrap data-selected:text-fg data-selected:border-acc"
+              >
                 {LABELS[t]}
               </TabsTab>
             ))}
           </TabsList>
-          <span className="grow" />
-          <Toolbar aria-label="Panel actions" className="ptabs-actions">
-            <TbButton label="Close Panel" icon="close" keys="mod+j" onClick={() => ide.set({ panelOpen: false })} />
-          </Toolbar>
+          <span className="flex-1" />
+          <TbSize value="sm">
+            <Toolbar aria-label="Panel actions" className="flex items-center gap-px p-0 border-0 bg-transparent">
+              <TbButton label="Close Panel" icon="close" keys="mod+j" onClick={() => ide.set({ panelOpen: false })} />
+            </Toolbar>
+          </TbSize>
         </div>
         {tabs.map((t) => (
-          <TabsPanel key={t} value={t} className="pbody">
+          <TabsPanel key={t} value={t} className="flex-1 flex flex-col min-h-0">
             {t === active ? <PanelBody id={t} /> : null}
           </TabsPanel>
         ))}
@@ -77,9 +84,9 @@ function PanelBody({ id }: { id: PanelId }) {
       return <CommandWindow />;
     case 'find':
       return (
-        <div className="out">
+        <Out>
           <FindResults />
-        </div>
+        </Out>
       );
     case 'uart':
       return <UartWindow />;

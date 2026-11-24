@@ -1,5 +1,6 @@
-import { Input } from '@ui-sdk/react/input';
-import { Tree, TreeGroup, TreeItem, TreeItemIndicator, TreeItemLabel } from '@ui-sdk/react/tree';
+import { Input } from '../ui/Input';
+import { Empty, VIEW, VIEW_SCROLL } from '../ui/kit';
+import { RowName, RowValue, Tree, TreeGroup, TreeItem, TreeItemIndicator, TreeItemLabel } from '../ui/tree';
 import { useState } from 'react';
 import type { RegisterSnapshot } from '../../host/types';
 import { baseName, hex32 } from '../../lib/format';
@@ -16,8 +17,10 @@ const REG_KEY = (n: string) => n.split(' ')[0];
 function Row({ name, value, changed, plain }: { name: string; value: string; changed?: boolean; plain?: boolean }) {
   return (
     <>
-      <span className="rn">{name}</span>
-      <span className={`rv${plain ? ' plain' : ''}${changed ? ' ch' : ''}`}>{value}</span>
+      <RowName>{name}</RowName>
+      <RowValue plain={plain} changed={changed}>
+        {value}
+      </RowValue>
     </>
   );
 }
@@ -40,7 +43,6 @@ function Registers({ r }: { r: RegisterSnapshot }) {
   return (
     <Tree
       aria-label="Registers"
-      className="tree regs"
       mode="none"
       defaultExpanded={['core', 'xpsr', 'internal']}
       onAction={(v) => {
@@ -53,7 +55,7 @@ function Registers({ r }: { r: RegisterSnapshot }) {
       <TreeItem value="core">
         <TreeItemLabel>
           <TreeItemIndicator />
-          <span className="rn grp">Core</span>
+          <RowName group>Core</RowName>
         </TreeItemLabel>
         <TreeGroup>
           {CORE.map((n, i) => (
@@ -88,7 +90,7 @@ function Registers({ r }: { r: RegisterSnapshot }) {
       <TreeItem value="banked">
         <TreeItemLabel>
           <TreeItemIndicator />
-          <span className="rn grp">Banked</span>
+          <RowName group>Banked</RowName>
         </TreeItemLabel>
         <TreeGroup>
           <TreeItem value="msp">
@@ -106,7 +108,7 @@ function Registers({ r }: { r: RegisterSnapshot }) {
       <TreeItem value="system">
         <TreeItemLabel>
           <TreeItemIndicator />
-          <span className="rn grp">System</span>
+          <RowName group>System</RowName>
         </TreeItemLabel>
         <TreeGroup>
           <TreeItem value="primask">
@@ -124,7 +126,7 @@ function Registers({ r }: { r: RegisterSnapshot }) {
       <TreeItem value="internal">
         <TreeItemLabel>
           <TreeItemIndicator />
-          <span className="rn grp">Internal</span>
+          <RowName group>Internal</RowName>
         </TreeItemLabel>
         <TreeGroup>
           <TreeItem value="mode">
@@ -167,7 +169,6 @@ function Watch() {
     <>
       <Tree
         aria-label="Watch 1"
-        className="tree"
         mode="none"
         onAction={async (v) => {
           const i = Number(v);
@@ -185,27 +186,31 @@ function Watch() {
           return (
             <TreeItem key={`${e}-${i}`} value={String(i)}>
               <TreeItemLabel>
-                <span className="rn mono">{e}</span>
-                <span
-                  className={`rv${val && 'error' in val ? ' err' : ''}${!val ? ' plain' : ''}`}
-                  title={val && !('error' in val) ? `${val.value_dec} (${val.kind})` : undefined}
-                >
+                <RowName mono>{e}</RowName>
+                <RowValue error={!!val && 'error' in val} plain={!val} title={val && !('error' in val) ? `${val.value_dec} (${val.kind})` : undefined}>
                   {text}
-                </span>
+                </RowValue>
               </TreeItemLabel>
             </TreeItem>
           );
         })}
       </Tree>
       <form
-        className="watch-add"
+        className="pt-0.5 pr-2.5 pb-1.5 pl-7"
         onSubmit={(ev) => {
           ev.preventDefault();
           if (draft.trim()) setWatchExprs([...exprs, draft.trim()]);
           setDraft('');
         }}
       >
-        <Input aria-label="Add watch expression" placeholder="<Enter expression>  R0, *0x20000000, GPIOC.ODR" value={draft} onValueChange={setDraft} />
+        <Input
+          compact
+          className="w-full italic"
+          aria-label="Add watch expression"
+          placeholder="<Enter expression>  R0, *0x20000000, GPIOC.ODR"
+          value={draft}
+          onValueChange={setDraft}
+        />
       </form>
     </>
   );
@@ -213,11 +218,10 @@ function Watch() {
 
 function CallStack() {
   const frames = useIde((s) => s.dbg?.call_stack ?? []);
-  if (!frames.length) return <p className="empty">No frames.</p>;
+  if (!frames.length) return <Empty>No frames.</Empty>;
   return (
     <Tree
       aria-label="Call Stack"
-      className="tree"
       onAction={(v) => {
         const f = frames[Number(v)];
         if (f?.file) setSearch({ file: f.file, line: f.line ?? undefined });
@@ -226,8 +230,8 @@ function CallStack() {
       {frames.map((f, i) => (
         <TreeItem key={i} value={String(i)}>
           <TreeItemLabel>
-            <span className="rn">{f.symbol || hex32(f.addr)}</span>
-            <span className="rv plain">{f.file ? `${baseName(f.file)}:${f.line ?? '?'}` : hex32(f.addr)}</span>
+            <RowName>{f.symbol || hex32(f.addr)}</RowName>
+            <RowValue plain>{f.file ? `${baseName(f.file)}:${f.line ?? '?'}` : hex32(f.addr)}</RowValue>
           </TreeItemLabel>
         </TreeItem>
       ))}
@@ -239,23 +243,23 @@ export function DebugView({ title }: { title: string }) {
   const dbg = useIde((s) => s.dbg);
   const session = useIde((s) => s.session);
   return (
-    <div className="view">
+    <div className={VIEW}>
       <ViewTitle title={title}>
         <CmdButton id="debug.toggle" pressed={session !== 'off'} />
         <TbButton label="Remove all watch expressions" icon="clear-all" onClick={() => setWatchExprs([])} />
       </ViewTitle>
-      <div className="view-scroll">
+      <div className={VIEW_SCROLL}>
         <Section title="Registers">
           {dbg ? (
             <Registers r={dbg.registers} />
           ) : (
-            <p className="empty">{session === 'starting' ? 'Starting...' : 'Start a debug session (Ctrl+F5) to see registers.'}</p>
+            <Empty>{session === 'starting' ? 'Starting...' : 'Start a debug session (Ctrl+F5) to see registers.'}</Empty>
           )}
         </Section>
         <Section title="Watch 1">
           <Watch />
         </Section>
-        <Section title="Call Stack">{dbg ? <CallStack /> : <p className="empty">Not debugging.</p>}</Section>
+        <Section title="Call Stack">{dbg ? <CallStack /> : <Empty>Not debugging.</Empty>}</Section>
       </div>
     </div>
   );

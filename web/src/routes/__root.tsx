@@ -75,7 +75,12 @@ function Root() {
   return (
     <>
       <Outlet />
-      <OverlayHost />
+      <OverlayHost
+        toast={{
+          className:
+            'mb-8 [&_[data-slot=toast]]:border [&_[data-slot=toast]]:border-border2 [&_[data-slot=toast]]:rounded-md [&_[data-slot=toast]]:bg-bg [&_[data-slot=toast]]:text-fg2 [&_[data-slot=toast]]:shadow-pop',
+        }}
+      />
     </>
   );
 }

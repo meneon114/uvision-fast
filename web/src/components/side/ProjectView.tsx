@@ -1,10 +1,10 @@
-import { Tree, TreeGroup, TreeItem, TreeItemIndicator, TreeItemLabel } from '@ui-sdk/react/tree';
+import { Empty, VIEW } from '../ui/kit';
+import { RowName, RowValue, Tree, TreeGroup, TreeIcon, TreeItem, TreeItemIndicator, TreeItemLabel } from '../ui/tree';
 import { useMemo } from 'react';
 import { baseName, normPath, samePath } from '../../lib/format';
 import { setSearch } from '../../lib/nav';
 import { useProjectSearch } from '../../lib/useProjectSearch';
 import { useIde } from '../../state/store';
-import { Icon } from '../Icon';
 import { CmdButton } from '../shell/TbButton';
 import { Section } from './Section';
 import { ViewTitle } from './ViewTitle';
@@ -51,17 +51,16 @@ export function ProjectView({ title }: { title: string }) {
   }, [session, symbols, disasm, activeDoc]);
 
   return (
-    <div className="view">
+    <div className={VIEW}>
       <ViewTitle title={title}>
         <CmdButton id="project.addItem" />
         <CmdButton id="project.addExisting" />
         <CmdButton id="project.options" />
       </ViewTitle>
-      <Section title={`Project: ${name}`} grow>
+      <Section title={`Project: ${name}`}>
         {project ? (
           <Tree
             aria-label="Project files"
-            className="tree"
             value={search.file ?? null}
             defaultExpanded={expanded}
             onAction={(v) => {
@@ -72,23 +71,23 @@ export function ProjectView({ title }: { title: string }) {
             <TreeItem value="target">
               <TreeItemLabel>
                 <TreeItemIndicator />
-                <Icon name="target" className="fi" />
-                <span className="rn">{target}</span>
+                <TreeIcon name="target" tone="acc" />
+                <RowName>{target}</RowName>
               </TreeItemLabel>
               <TreeGroup>
                 {project.groups.map((g) => (
                   <TreeItem key={g.name} value={`g:${g.name}`}>
                     <TreeItemLabel>
                       <TreeItemIndicator />
-                      <Icon name="folder-opened" className="fi" />
-                      <span className="rn">{g.name}</span>
+                      <TreeIcon name="folder-opened" tone="acc" />
+                      <RowName>{g.name}</RowName>
                     </TreeItemLabel>
                     <TreeGroup>
                       {g.files.map((f) => (
                         <TreeItem key={f.abs_path} value={f.abs_path}>
                           <TreeItemLabel data-current={samePath(f.abs_path, search.file) || undefined}>
-                            <Icon name={fileIcon(f.file_type, f.abs_path)} className="fi asm" />
-                            <span className="rn">{f.name}</span>
+                            <TreeIcon name={fileIcon(f.file_type, f.abs_path)} tone="asm" />
+                            <RowName>{f.name}</RowName>
                           </TreeItemLabel>
                         </TreeItem>
                       ))}
@@ -99,14 +98,13 @@ export function ProjectView({ title }: { title: string }) {
             </TreeItem>
           </Tree>
         ) : (
-          <p className="empty">Open a project from File &gt; Open or a lab example.</p>
+          <Empty>Open a project from File &gt; Open or a lab example.</Empty>
         )}
       </Section>
       <Section title="Functions">
         {functions.length ? (
           <Tree
             aria-label="Functions"
-            className="tree"
             mode="none"
             onAction={(v) => {
               const f = functions[Number(v)];
@@ -116,15 +114,15 @@ export function ProjectView({ title }: { title: string }) {
             {functions.map((f, i) => (
               <TreeItem key={`${f.name}-${i}`} value={String(i)}>
                 <TreeItemLabel>
-                  <Icon name={/vector/i.test(f.name) ? 'symbol-variable' : 'symbol-method'} className="fi" />
-                  <span className="rn">{f.name}</span>
-                  {f.line ? <span className="rv plain">:{f.line}</span> : null}
+                  <TreeIcon name={/vector/i.test(f.name) ? 'symbol-variable' : 'symbol-method'} tone="acc" />
+                  <RowName>{f.name}</RowName>
+                  {f.line ? <RowValue plain>:{f.line}</RowValue> : null}
                 </TreeItemLabel>
               </TreeItem>
             ))}
           </Tree>
         ) : (
-          <p className="empty">No labels in the open file.</p>
+          <Empty>No labels in the open file.</Empty>
         )}
       </Section>
     </div>

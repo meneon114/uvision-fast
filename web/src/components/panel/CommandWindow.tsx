@@ -1,7 +1,7 @@
-import { Input } from '@ui-sdk/react/input';
 import { useEffect, useRef, useState } from 'react';
 import { runCommand } from '../../state/ide';
 import { useIde } from '../../state/store';
+import { CMD_WIN, Line, Out, PromptForm, PromptInput } from './Out';
 
 export function CommandWindow() {
   const log = useIde((s) => s.cmdLog);
@@ -13,27 +13,24 @@ export function CommandWindow() {
     out.current?.scrollTo({ top: out.current.scrollHeight });
   }, [log]);
   return (
-    <div className="cmdwin">
-      <div className="out mono" ref={out} role="log" aria-label="Command output">
-        {log.length === 0 ? <div className="ol muted">Type help for Keil-style debugger commands (g, t, p, bs, bc, d, e, r, reset).</div> : null}
+    <div className={CMD_WIN}>
+      <Out mono ref={out} role="log" aria-label="Command output">
+        {log.length === 0 ? <Line tone="muted">Type help for Keil-style debugger commands (g, t, p, bs, bc, d, e, r, reset).</Line> : null}
         {log.map((l, i) => (
-          <div key={i} className={`ol ${l.kind}`}>
+          <Line key={i} tone={l.kind}>
             {l.kind === 'in' ? `> ${l.text}` : l.text}
-          </div>
+          </Line>
         ))}
-      </div>
-      <form
-        className="cmdin"
-        onSubmit={(e) => {
-          e.preventDefault();
+      </Out>
+      <PromptForm
+        prompt=">"
+        onSubmit={() => {
           void runCommand(text);
           setText('');
           setPos(-1);
         }}
       >
-        <span aria-hidden="true">&gt;</span>
-        <Input
-          className="mono"
+        <PromptInput
           aria-label="Debugger command"
           placeholder="ASSIGN  BreakDisable  BreakEnable  BreakKill  BreakList  BreakSet  g  t  p  d  e  r"
           value={text}
@@ -57,7 +54,7 @@ export function CommandWindow() {
             }
           }}
         />
-      </form>
+      </PromptForm>
     </div>
   );
 }

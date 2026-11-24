@@ -1,4 +1,6 @@
-import { Input } from '@ui-sdk/react/input';
+import { Input } from '../ui/Input';
+import { cx } from '../../lib/cx';
+import { CMD_WIN, Out } from './Out';
 import { useEffect, useState } from 'react';
 import { toast } from '@ui-sdk/react/toast';
 import { hex32, hex8 } from '../../lib/format';
@@ -39,9 +41,9 @@ export function MemoryWindow({ idx }: { idx: number }) {
   };
 
   return (
-    <div className="memwin">
+    <div className={CMD_WIN}>
       <form
-        className="memaddr"
+        className="h-7.5 flex items-center gap-2 px-3 border-b border-border flex-none text-sm text-muted"
         onSubmit={(e) => {
           e.preventDefault();
           if (draft.trim()) setMemAddr(idx, draft.trim());
@@ -50,7 +52,9 @@ export function MemoryWindow({ idx }: { idx: number }) {
         <label htmlFor={`mem-addr-${idx}`}>Address:</label>
         <Input
           id={`mem-addr-${idx}`}
-          className="mono"
+          mono
+          compact
+          className="w-45"
           aria-label={`Memory ${idx + 1} address`}
           value={draft}
           onValueChange={setDraft}
@@ -58,23 +62,26 @@ export function MemoryWindow({ idx }: { idx: number }) {
         />
       </form>
       {session !== 'on' ? (
-        <div className="out muted">Memory windows read target memory while a debug session runs.</div>
+        <Out muted>Memory windows read target memory while a debug session runs.</Out>
       ) : !mem ? (
-        <div className="out muted">Reading {addr}...</div>
+        <Out muted>Reading {addr}...</Out>
       ) : (
-        <div className="out mono mem" role="grid" aria-label={`Memory ${idx + 1}`} aria-readonly="false">
+        <Out mono className="leading-5" role="grid" aria-label={`Memory ${idx + 1}`} aria-readonly="false">
           {rows.map((o) => (
-            <div className="mrow" role="row" key={o}>
-              <span className="ma" role="rowheader">
+            <div className="flex gap-4.5 whitespace-pre" role="row" key={o}>
+              <span className="text-t-a" role="rowheader">
                 {hex32(mem.addr + o)}:
               </span>
-              <span className="mb">
+              <span className="flex gap-0.5">
                 {mem.bytes.slice(o, o + ROW).map((b, i) => (
                   <button
                     type="button"
                     role="gridcell"
                     key={i}
-                    className={changed.has(o + i) ? 'ch' : undefined}
+                    className={cx(
+                      'px-0.75 border-0 rounded-xs bg-transparent cursor-pointer nth-[4n+1]:ml-1.5 hover:bg-hover',
+                      changed.has(o + i) ? 'text-chg font-semibold' : 'text-fg2',
+                    )}
                     aria-label={`${hex32(mem.addr + o + i)} = ${hex8(b)}`}
                     onClick={() => void edit(o + i)}
                   >
@@ -82,7 +89,7 @@ export function MemoryWindow({ idx }: { idx: number }) {
                   </button>
                 ))}
               </span>
-              <span className="mc" aria-hidden="true">
+              <span className="text-muted" aria-hidden="true">
                 {mem.bytes
                   .slice(o, o + ROW)
                   .map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.'))
@@ -90,7 +97,7 @@ export function MemoryWindow({ idx }: { idx: number }) {
               </span>
             </div>
           ))}
-        </div>
+        </Out>
       )}
     </div>
   );

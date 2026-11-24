@@ -119,5 +119,5 @@ export function CodeEditor({ path, line }: { path: string; line?: number }) {
     }
   }, [line, path, doc !== undefined, dbg?.pc]);
 
-  return <div ref={host} className="cm-host" data-file={path} />;
+  return <div ref={host} className="cm-host flex-1 min-h-0 flex" data-file={path} />;
 }

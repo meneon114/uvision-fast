@@ -15,6 +15,7 @@ import {
   lineNumbers,
 } from '@codemirror/view';
 import { tags } from '@lezer/highlight';
+import { BP_MARK, EXEC_MARK, GUT, GUT_HINT, PC_MARK } from './marks';
 
 const ASM_DIRECTIVES = new Set([
   'AREA',
@@ -396,12 +397,16 @@ class Marker extends GutterMarker {
   }
   toDOM(): HTMLElement {
     const el = document.createElement('div');
-    el.className = 'uv-mark';
-    if (this.exec) el.appendChild(Object.assign(document.createElement('b'), { className: 'uv-exec' }));
-    if (this.bp) el.appendChild(Object.assign(document.createElement('span'), { className: 'uv-bp' }));
+    el.className = `${GUT} ${GUT_HINT}`;
+    if (this.exec) el.appendChild(Object.assign(document.createElement('b'), { className: EXEC_MARK }));
+    if (this.bp) {
+      const dot = Object.assign(document.createElement('span'), { className: BP_MARK });
+      dot.dataset.bp = '';
+      el.appendChild(dot);
+    }
     if (this.pc) {
       const a = document.createElement('i');
-      a.className = 'codicon codicon-debug-stackframe uv-pc';
+      a.className = `codicon codicon-debug-stackframe ${PC_MARK}`;
       a.setAttribute('aria-hidden', 'true');
       el.appendChild(a);
     }

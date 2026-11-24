@@ -1,6 +1,7 @@
-import { Button } from '@ui-sdk/react/button';
+import { Button, iconButton } from '../ui/Button';
+import { CAPS, Empty, Note } from '../ui/kit';
 import { toast } from '@ui-sdk/react/toast';
-import { Tree, TreeItem, TreeItemLabel } from '@ui-sdk/react/tree';
+import { RowName, RowValue, Tree, TreeIcon, TreeItem, TreeItemLabel } from '../ui/tree';
 import { useEffect, useRef, useState } from 'react';
 import { host } from '../../host/client';
 import type { ExampleInfo } from '../../host/types';
@@ -72,7 +73,7 @@ export function WorkspaceDialog() {
           >
             <Icon name="discard" /> Reset Examples
           </Button>
-          <span className="grow" />
+          <span className="flex-1" />
           <input
             ref={picker}
             type="file"
@@ -89,42 +90,40 @@ export function WorkspaceDialog() {
           <Button onClick={() => picker.current?.click()}>
             <Icon name="cloud-upload" /> Import Files...
           </Button>
-          <Button data-variant="solid" onClick={closeDialog}>
+          <Button variant="solid" onClick={closeDialog}>
             Close
           </Button>
         </>
       }
     >
-      <div className="ws-cols">
+      <div className="grid grid-cols-2 gap-4 phone:grid-cols-1">
         <section>
-          <h3>Projects</h3>
+          <h3 className={`${CAPS} mb-1.5`}>Projects</h3>
           <FileList files={projects} icon="project" onOpen={openOne} onDeleted={load} />
         </section>
         <section>
-          <h3>Source Files</h3>
+          <h3 className={`${CAPS} mb-1.5`}>Source Files</h3>
           <FileList files={sources} icon="file-code" onOpen={openOne} onDeleted={load} />
         </section>
       </div>
-      <p className="note">Tip: drop project folders or files anywhere on the window to import them.</p>
+      <Note>Tip: drop project folders or files anywhere on the window to import them.</Note>
     </Modal>
   );
 }
 
 function FileList({ files, icon, onOpen, onDeleted }: { files: string[]; icon: string; onOpen: (p: string) => void; onDeleted: () => void }) {
-  if (!files.length) return <p className="empty">None yet.</p>;
+  if (!files.length) return <Empty>None yet.</Empty>;
   return (
-    <Tree aria-label="Files" className="tree ws-tree" mode="none" onAction={(v) => onOpen(String(v))}>
+    <Tree aria-label="Files" mode="none" onAction={(v) => onOpen(String(v))}>
       {files.map((f) => (
         <TreeItem key={f} value={f}>
-          <TreeItemLabel>
-            <Icon name={icon} className="fi" />
-            <span className="rn" title={f}>
-              {baseName(f)}
-            </span>
-            <span className="rv plain">{f.slice(0, -baseName(f).length - 1)}</span>
+          <TreeItemLabel flat>
+            <TreeIcon name={icon} tone="acc" />
+            <RowName title={f}>{baseName(f)}</RowName>
+            <RowValue plain>{f.slice(0, -baseName(f).length - 1)}</RowValue>
             <button
               type="button"
-              className="icon-btn row-action"
+              className={`${iconButton()} opacity-0 group-hover/label:opacity-100 focus-visible:opacity-100`}
               aria-label={`Delete ${f}`}
               onClick={async (e) => {
                 e.stopPropagation();
@@ -135,7 +134,7 @@ function FileList({ files, icon, onOpen, onDeleted }: { files: string[]; icon: s
                 onDeleted();
               }}
             >
-              <Icon name="trash" />
+              <Icon name="trash" className="text-md text-muted" />
             </button>
           </TreeItemLabel>
         </TreeItem>
@@ -165,14 +164,14 @@ export function ExamplesDialog() {
       footer={<Button onClick={closeDialog}>Close</Button>}
     >
       {hostKind !== 'web' ? (
-        <p className="muted">Lab examples ship with the browser version. In VS Code, open a project folder with File, Open.</p>
+        <p className="text-muted">Lab examples ship with the browser version. In VS Code, open a project folder with File, Open.</p>
       ) : (
-        <ul className="examples">
+        <ul className="list-none m-0 p-0 grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2">
           {items.map((ex) => (
             <li key={ex.id}>
               <button
                 type="button"
-                className="example"
+                className="size-full flex flex-col items-start gap-0.75 py-2.5 px-3 border border-border2 rounded-sm bg-bg text-left cursor-pointer transition-[border-color,translate] duration-120 ease-snap hover:border-acc active:translate-y-px"
                 onClick={async () => {
                   closeDialog();
                   try {
@@ -183,9 +182,9 @@ export function ExamplesDialog() {
                   }
                 }}
               >
-                <span className="lab">{ex.lab}</span>
-                <strong>{ex.title}</strong>
-                <span className="muted">{ex.description}</span>
+                <span className="text-2xs text-acc tracking-[0.03em] uppercase">{ex.lab}</span>
+                <strong className="text-fg font-semibold">{ex.title}</strong>
+                <span className="text-muted text-sm">{ex.description}</span>
               </button>
             </li>
           ))}

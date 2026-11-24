@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { BuildResult, DebugState, DisasmLine, LogicChannel, MemoryReadResult, PeripheralSnapshot, SymbolInfo, UvProject, WatchEval } from '../host/types';
 import { normPath } from '../lib/format';
 
-/** Phone breakpoint; keep in sync with the `max-width: 720px` block in styles/app.css. */
+/** Phone breakpoint; keep in sync with the `phone` variant in styles/index.css. */
 export const PHONE_QUERY = '(max-width: 720px)';
 
 export function isNarrowScreen(): boolean {

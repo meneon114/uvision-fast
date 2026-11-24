@@ -15,7 +15,7 @@ const TITLES: Record<SideView, string> = {
 
 export function SideBar({ view }: { view: SideView }) {
   return (
-    <aside className="side" aria-label={`${TITLES[view]} view`}>
+    <aside className="flex-1 flex flex-col min-h-0 bg-chrome" aria-label={`${TITLES[view]} view`}>
       {view === 'project' ? <ProjectView title={TITLES.project} /> : null}
       {view === 'find' ? <FindView title={TITLES.find} /> : null}
       {view === 'debug' ? <DebugView title={TITLES.debug} /> : null}

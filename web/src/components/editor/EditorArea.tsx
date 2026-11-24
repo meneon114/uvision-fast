@@ -1,4 +1,4 @@
-import { Resizable, ResizableHandle, ResizablePanel } from '@ui-sdk/react/resizable';
+import { Resizable, ResizableHandle, ResizablePanel } from '../ui/resizable';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
 import type { ReactNode } from 'react';
 import { baseName, normPath, samePath } from '../../lib/format';
@@ -9,6 +9,7 @@ import { isDirty, useIde } from '../../state/store';
 import { Icon } from '../Icon';
 import { CodeEditor } from './CodeEditor';
 import { Disassembly } from './Disassembly';
+import { GROUP, TAB, TAB_BAR, TAB_WRAP } from './tabs';
 import { Welcome } from './Welcome';
 
 function fileIcon(p: string): string {
@@ -33,7 +34,10 @@ function Breadcrumbs({ path }: { path: string }) {
   const name = project?.project_file ? baseName(project.project_file).replace(/\.uvprojx?$/i, '') : null;
   const label = enclosingLabel(content, line);
   return (
-    <nav className="crumbs" aria-label="Breadcrumbs">
+    <nav
+      className="h-6 flex items-center gap-1 px-3.5 text-sm text-muted flex-none overflow-hidden whitespace-nowrap [&_.codicon]:text-base"
+      aria-label="Breadcrumbs"
+    >
       {name ? (
         <>
           <span>{name}</span>
@@ -50,7 +54,7 @@ function Breadcrumbs({ path }: { path: string }) {
       {label ? (
         <>
           <Icon name="chevron-right" />
-          <Icon name="symbol-method" className="fi" />
+          <Icon name="symbol-method" className="text-acc" />
           <span>{label}</span>
         </>
       ) : null}
@@ -65,48 +69,54 @@ function EditorGroup({ children }: { children?: ReactNode }) {
   const active = tabs.find((t) => samePath(t, search.file)) ?? null;
   const loaded = active ? !!docs[normPath(active)] : false;
 
-  if (children) return <div className="group">{children}</div>;
+  if (children) return <div className={GROUP}>{children}</div>;
   if (!active) {
     return (
-      <div className="group">
+      <div className={GROUP}>
         <Welcome />
       </div>
     );
   }
 
   return (
-    <div className="group">
-      <Tabs value={active} onValueChange={(v) => v && setSearch({ file: v, line: undefined })} className="editor-tabs">
-        <TabsList aria-label="Open files" className="tabs">
+    <div className={GROUP}>
+      <Tabs value={active} onValueChange={(v) => v && setSearch({ file: v, line: undefined })} className="flex-1 flex flex-col min-h-0">
+        <TabsList aria-label="Open files" className={TAB_BAR}>
           {tabs.map((t) => {
             const dirty = isDirty(docs[normPath(t)]);
             return (
-              <div className="tab-wrap" key={t} data-active={t === active || undefined}>
+              <div className={TAB_WRAP} key={t} data-active={t === active || undefined}>
                 <TabsTab
                   value={t}
-                  className="tab"
+                  className={TAB}
                   title={t}
                   onAuxClick={(e) => {
                     if (e.button === 1) closeTab(t);
                   }}
                 >
-                  <Icon name={fileIcon(t)} className="fi" />
+                  <Icon name={fileIcon(t)} className="text-asm text-md" />
                   <span>{baseName(t)}</span>
-                  {dirty ? <span className="dot" aria-label="Unsaved changes" /> : null}
+                  {dirty ? <span className="size-2 mx-0.5 rounded-full bg-fg2" aria-label="Unsaved changes" /> : null}
                 </TabsTab>
-                <button type="button" className="tab-x" tabIndex={-1} aria-label={`Close ${baseName(t)}`} onClick={() => closeTab(t)}>
-                  <Icon name="close" />
+                <button
+                  type="button"
+                  className="grid place-items-center size-5 mr-1.5 p-0 border-0 rounded-xs bg-transparent text-muted cursor-pointer opacity-0 group-hover/tab:opacity-100 group-data-active/tab:opacity-100 hover:bg-hover"
+                  tabIndex={-1}
+                  aria-label={`Close ${baseName(t)}`}
+                  onClick={() => closeTab(t)}
+                >
+                  <Icon name="close" className="text-md" />
                 </button>
               </div>
             );
           })}
         </TabsList>
         {tabs.map((t) => (
-          <TabsPanel key={t} value={t} className="editor-panel">
+          <TabsPanel key={t} value={t} className="flex-1 flex flex-col min-h-0">
             {t === active ? (
               <>
                 <Breadcrumbs path={t} />
-                {loaded ? <CodeEditor path={t} line={search.line} /> : <div className="loading">Loading {baseName(t)}...</div>}
+                {loaded ? <CodeEditor path={t} line={search.line} /> : <div className="p-4 text-muted">Loading {baseName(t)}...</div>}
               </>
             ) : null}
           </TabsPanel>
@@ -123,11 +133,11 @@ export function EditorArea({ override }: { override?: ReactNode }) {
 
   if (!showDisasm) return <EditorGroup>{override}</EditorGroup>;
   return (
-    <Resizable orientation="horizontal" className="editor-split" autoSaveId="uv-editor-split">
+    <Resizable orientation="horizontal" className="flex-1 min-h-0" autoSaveId="uv-editor-split">
       <ResizablePanel id="source" minSize="240px">
         <EditorGroup />
       </ResizablePanel>
-      <ResizableHandle aria-label="Resize disassembly" className="handle" />
+      <ResizableHandle aria-label="Resize disassembly" />
       <ResizablePanel id="disasm" defaultSize="38%" minSize="220px">
         <Disassembly />
       </ResizablePanel>

@@ -1,10 +1,12 @@
-import { Input } from '@ui-sdk/react/input';
+import { Input } from '../ui/Input';
+import { iconButton } from '../ui/Button';
 import { Toolbar } from '@ui-sdk/react/toolbar';
 import { useEffect, useRef, useState } from 'react';
 import type { LogicChannel } from '../../host/types';
 import { logicAdd, logicRemove } from '../../state/ide';
 import { useIde } from '../../state/store';
-import { TbButton } from '../shell/TbButton';
+import { TbButton, TbSize } from '../shell/TbButton';
+import { CMD_WIN, Out } from './Out';
 
 const LABEL_W = 120;
 const HEADER_H = 20;
@@ -188,15 +190,16 @@ export function LogicAnalyzer() {
   };
 
   return (
-    <div className="logic">
-      <div className="logic-bar">
-        <Toolbar aria-label="Logic Analyzer" className="logic-tools">
-          <TbButton label="Zoom In" icon="zoom-in" onClick={() => zoom(1.5)} />
-          <TbButton label="Zoom Out" icon="zoom-out" onClick={() => zoom(1 / 1.5)} />
-          <TbButton label="Zoom to Fit" icon="screen-full" onClick={() => zoom(null)} />
-        </Toolbar>
+    <div className={CMD_WIN}>
+      <div className="min-h-7.5 flex items-center flex-wrap gap-1.5 py-0.5 px-2.5 border-b border-border flex-none">
+        <TbSize value="sm">
+          <Toolbar aria-label="Logic Analyzer" className="flex items-center gap-px p-0 border-0 bg-transparent">
+            <TbButton label="Zoom In" icon="zoom-in" onClick={() => zoom(1.5)} />
+            <TbButton label="Zoom Out" icon="zoom-out" onClick={() => zoom(1 / 1.5)} />
+            <TbButton label="Zoom to Fit" icon="screen-full" onClick={() => zoom(null)} />
+          </Toolbar>
+        </TbSize>
         <form
-          className="logic-add"
           onSubmit={(e) => {
             e.preventDefault();
             if (signal.trim()) void logicAdd(signal.trim());
@@ -204,7 +207,9 @@ export function LogicAnalyzer() {
           }}
         >
           <Input
-            className="mono"
+            mono
+            compact
+            className="w-60"
             aria-label="Add signal"
             placeholder="Add signal: GPIOC.ODR, R0, TIM2.CNT"
             value={signal}
@@ -212,25 +217,30 @@ export function LogicAnalyzer() {
             disabled={session !== 'on'}
           />
         </form>
-        <ul className="logic-sigs" aria-label="Signals">
+        <ul className="flex flex-wrap gap-1 m-0 p-0 list-none" aria-label="Signals">
           {channels.map((c) => (
-            <li key={c.signal}>
-              <span className="mono">{c.signal}</span>
-              <button type="button" className="icon-btn" aria-label={`Remove ${c.signal}`} onClick={() => void logicRemove(c.signal)}>
-                <i className="codicon codicon-close" aria-hidden="true" />
+            <li key={c.signal} className="inline-flex items-center gap-0.5 pl-1.5 border border-border2 rounded-sm text-xs">
+              <span className="font-mono text-ui">{c.signal}</span>
+              <button type="button" className={iconButton('sm')} aria-label={`Remove ${c.signal}`} onClick={() => void logicRemove(c.signal)}>
+                <i className="codicon codicon-close text-sm" aria-hidden="true" />
               </button>
             </li>
           ))}
         </ul>
-        <span className="grow" />
-        <span className="logic-info mono" aria-live="polite">
+        <span className="flex-1" />
+        <span className="max-w-1/2 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-xs text-muted phone:max-w-full" aria-live="polite">
           {info}
         </span>
       </div>
-      <div className="logic-plot">
-        {session !== 'on' && !channels.length ? <div className="out muted">Start a debug session to trace signals.</div> : null}
+      <div className="flex-1 relative min-h-0 overflow-hidden">
+        {session !== 'on' && !channels.length ? (
+          <Out muted className="absolute inset-0 z-1 bg-transparent pointer-events-none">
+            Start a debug session to trace signals.
+          </Out>
+        ) : null}
         <canvas
           ref={canvas}
+          className="absolute inset-0 block"
           role="img"
           aria-label={`Logic analyzer trace of ${channels.map((c) => c.signal).join(', ') || 'no signals'}`}
           onPointerMove={(e) => {

@@ -1,8 +1,6 @@
-import '@ui-sdk/core/web.css';
-import '@vscode/codicons/dist/codicon.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/600.css';
-import './styles/app.css';
+import './styles/index.css';
 import { RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';

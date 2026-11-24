@@ -1,4 +1,4 @@
-import { Button } from '@ui-sdk/react/button';
+import { Button } from '../ui/Button';
 import { useEffect, useState } from 'react';
 import { ide, useIde } from '../../state/store';
 import { Modal, TextField } from './Modal';
@@ -29,7 +29,7 @@ export function PromptDialog() {
       footer={
         <>
           <Button onClick={() => finish(null)}>Cancel</Button>
-          <Button data-variant="solid" type="submit" form="prompt-form">
+          <Button variant="solid" type="submit" form="prompt-form">
             OK
           </Button>
         </>

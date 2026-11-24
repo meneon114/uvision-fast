@@ -1,11 +1,11 @@
-import { Button } from '@ui-sdk/react/button';
+import { Button } from '../ui/Button';
 import { toast } from '@ui-sdk/react/toast';
 import { useEffect, useState } from 'react';
 import { host } from '../../host/client';
 import { errMsg } from '../../lib/format';
 import { addFileToProject, newProject } from '../../state/ide';
 import { useIde } from '../../state/store';
-import { closeDialog, Modal, SelectField, TextField } from './Modal';
+import { closeDialog, FIELD_ROW, formGrid, Modal, SelectField, TextField } from './Modal';
 
 export function NewProjectDialog() {
   const open = useIde((s) => s.dialog === 'newProject');
@@ -33,7 +33,7 @@ export function NewProjectDialog() {
         <>
           <Button onClick={closeDialog}>Cancel</Button>
           <Button
-            data-variant="solid"
+            variant="solid"
             disabled={!dir.trim() || !name.trim() || busy}
             onClick={async () => {
               setBusy(true);
@@ -52,7 +52,7 @@ export function NewProjectDialog() {
         </>
       }
     >
-      <div className="form-grid">
+      <div className={formGrid()}>
         <TextField
           label="Project Name"
           value={name}
@@ -62,7 +62,7 @@ export function NewProjectDialog() {
             if (hostKind === 'web' && !dirTouched) setDir(`/Workspace/${v.trim() || 'LabProject'}`);
           }}
         />
-        <div className="field-row">
+        <div className={FIELD_ROW}>
           <TextField
             label="Folder"
             value={dir}
@@ -134,7 +134,7 @@ export function AddItemDialog() {
       footer={
         <>
           <Button onClick={closeDialog}>Cancel</Button>
-          <Button data-variant="solid" type="submit" form="add-item-form" disabled={!name.trim()}>
+          <Button variant="solid" type="submit" form="add-item-form" disabled={!name.trim()}>
             Add
           </Button>
         </>
@@ -142,7 +142,7 @@ export function AddItemDialog() {
     >
       <form
         id="add-item-form"
-        className="form-grid one"
+        className={formGrid(true)}
         onSubmit={(e) => {
           e.preventDefault();
           void submit();

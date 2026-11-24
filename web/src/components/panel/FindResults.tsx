@@ -1,9 +1,8 @@
-import { Tree, TreeGroup, TreeItem, TreeItemIndicator, TreeItemLabel } from '@ui-sdk/react/tree';
+import { RowName, RowValue, Tree, TreeGroup, TreeIcon, TreeItem, TreeItemIndicator, TreeItemLabel } from '../ui/tree';
 import { useMemo } from 'react';
 import { baseName } from '../../lib/format';
 import { setSearch } from '../../lib/nav';
 import { useFind, type FindHit } from '../../state/find';
-import { Icon } from '../Icon';
 
 export function FindResults() {
   const hits = useFind((s) => s.hits);
@@ -16,7 +15,6 @@ export function FindResults() {
   return (
     <Tree
       aria-label="Find results"
-      className="tree find-tree"
       mode="none"
       defaultExpanded={byFile.map(([f]) => f)}
       onAction={(v) => {
@@ -28,16 +26,16 @@ export function FindResults() {
         <TreeItem key={file} value={file}>
           <TreeItemLabel>
             <TreeItemIndicator />
-            <Icon name="file-code" className="fi asm" />
-            <span className="rn">{baseName(file)}</span>
-            <span className="badge">{list.length}</span>
+            <TreeIcon name="file-code" tone="asm" />
+            <RowName>{baseName(file)}</RowName>
+            <span>{list.length}</span>
           </TreeItemLabel>
           <TreeGroup>
             {list.map(({ hit, i }) => (
               <TreeItem key={i} value={String(i)}>
                 <TreeItemLabel>
-                  <span className="rv plain">{hit.line}</span>
-                  <span className="rn mono">{hit.text}</span>
+                  <RowValue plain>{hit.line}</RowValue>
+                  <RowName mono>{hit.text}</RowName>
                 </TreeItemLabel>
               </TreeItem>
             ))}

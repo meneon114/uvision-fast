@@ -1,11 +1,14 @@
-import { Button } from '@ui-sdk/react/button';
+import { Button } from '../ui/Button';
+import { Note } from '../ui/kit';
 import { Tabs, TabsList, TabsPanel, TabsTab } from '@ui-sdk/react/tabs';
 import { useEffect, useState } from 'react';
 import type { TargetOptions } from '../../host/types';
 import { hex32, parseNum } from '../../lib/format';
 import { saveOptions } from '../../state/ide';
 import { useIde } from '../../state/store';
-import { CheckField, closeDialog, Modal, SelectField, TextField } from './Modal';
+import { CheckField, closeDialog, formGrid, Modal, SelectField, TextField } from './Modal';
+
+const SEG_TAB = 'h-7.5 font-normal text-muted data-selected:border-acc data-selected:text-fg';
 
 const DEVICES: [string, string][] = [
   ['STM32F103C8', 'STM32F103C8 (Blue Pill, 64 KB)'],
@@ -87,7 +90,7 @@ export function OptionsDialog() {
         <>
           <Button onClick={closeDialog}>Cancel</Button>
           <Button
-            data-variant="solid"
+            variant="solid"
             disabled={!d || !project || saving}
             onClick={async () => {
               if (!d || !project) return;
@@ -108,17 +111,27 @@ export function OptionsDialog() {
       }
     >
       {!project || !d ? (
-        <p className="muted">Open a project to edit its target options.</p>
+        <p className="text-muted">Open a project to edit its target options.</p>
       ) : (
-        <Tabs value={tab} onValueChange={(v) => v && setTab(String(v))} className="opt-tabs">
-          <TabsList aria-label="Option pages" className="seg-tabs">
-            <TabsTab value="target">Target</TabsTab>
-            <TabsTab value="output">Output</TabsTab>
-            <TabsTab value="asm">Asm</TabsTab>
-            <TabsTab value="c">C/C++</TabsTab>
-            <TabsTab value="debug">Debug</TabsTab>
+        <Tabs value={tab} onValueChange={(v) => v && setTab(String(v))}>
+          <TabsList aria-label="Option pages" className="-mt-1 mb-3.5 gap-0.5">
+            <TabsTab value="target" className={SEG_TAB}>
+              Target
+            </TabsTab>
+            <TabsTab value="output" className={SEG_TAB}>
+              Output
+            </TabsTab>
+            <TabsTab value="asm" className={SEG_TAB}>
+              Asm
+            </TabsTab>
+            <TabsTab value="c" className={SEG_TAB}>
+              C/C++
+            </TabsTab>
+            <TabsTab value="debug" className={SEG_TAB}>
+              Debug
+            </TabsTab>
           </TabsList>
-          <TabsPanel value="target" className="form-grid">
+          <TabsPanel value="target" className={formGrid()}>
             <SelectField
               label="Device"
               value={d.device}
@@ -131,13 +144,13 @@ export function OptionsDialog() {
             <TextField label="IRAM1 Start" value={d.rw_base} onChange={set('rw_base')} mono />
             <TextField label="IRAM1 Size" value={d.rw_size} onChange={set('rw_size')} mono />
           </TabsPanel>
-          <TabsPanel value="output" className="form-grid">
+          <TabsPanel value="output" className={formGrid()}>
             <TextField label="Name of Executable" value={d.output_name} onChange={set('output_name')} mono />
             <TextField label="Output Folder" value={d.output_dir} onChange={set('output_dir')} mono />
             <CheckField label="Create HEX File" checked={d.create_hex} onChange={set('create_hex')} />
             <CheckField label="Create BIN File" checked={d.create_bin} onChange={set('create_bin')} />
           </TabsPanel>
-          <TabsPanel value="asm" className="form-grid">
+          <TabsPanel value="asm" className={formGrid()}>
             <SelectField
               label="Assembler Syntax"
               value={d.asm_syntax}
@@ -151,13 +164,13 @@ export function OptionsDialog() {
             <TextField label="Include Paths" value={d.a_includes} onChange={set('a_includes')} mono hint="Semicolon separated." />
             <TextField label="Misc Controls" value={d.a_misc} onChange={set('a_misc')} mono />
           </TabsPanel>
-          <TabsPanel value="c" className="form-grid">
-            <p className="note span2">C sources build with the Keil toolchain from VS Code. The browser assembles assembly only.</p>
+          <TabsPanel value="c" className={formGrid()}>
+            <Note className="col-span-full">C sources build with the Keil toolchain from VS Code. The browser assembles assembly only.</Note>
             <TextField label="Define" value={d.c_defines} onChange={set('c_defines')} mono />
             <TextField label="Include Paths" value={d.c_includes} onChange={set('c_includes')} mono />
             <TextField label="Misc Controls" value={d.c_misc} onChange={set('c_misc')} mono />
           </TabsPanel>
-          <TabsPanel value="debug" className="form-grid">
+          <TabsPanel value="debug" className={formGrid()}>
             <SelectField
               label="Debugger"
               value={d.debug_mode}
