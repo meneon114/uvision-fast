@@ -16,7 +16,9 @@ function fileIcon(t: number, p: string) {
 function labelsOf(content: string): { name: string; line: number }[] {
   const out: { name: string; line: number }[] = [];
   content.split('\n').forEach((l, i) => {
-    const m = /^([A-Za-z_][\w]*)\b(\s+(?!EQU\b|RN\b|DCD\b|DCW\b|DCB\b|SPACE\b)|\s*$)/.exec(l);
+    // Possessive-style: `\s+(?=\S)` pins the lookahead to the next token, so backtracking
+    // over the whitespace can't sneak an EQU/RN/DCx constant past it.
+    const m = /^([A-Za-z_][\w]*)\b(\s+(?=\S)(?!EQU\b|RN\b|DCD\b|DCW\b|DCB\b|SPACE\b)|\s*$)/i.exec(l);
     if (m && !/^(AREA|END|EXPORT|IMPORT|THUMB|ALIGN|ENTRY|PRESERVE8)$/i.test(m[1])) out.push({ name: m[1], line: i + 1 });
   });
   return out;

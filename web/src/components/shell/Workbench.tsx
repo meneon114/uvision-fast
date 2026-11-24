@@ -12,8 +12,6 @@ import { KeilToolbar } from './KeilToolbar';
 import { StatusBar } from './StatusBar';
 import { TitleBar } from './TitleBar';
 
-const PHONE = '(max-width: 720px)';
-
 // The whole IDE frame. Routes render it with their own editor content when
 // they are pending or failed, so the chrome never disappears.
 export function Workbench({ editor }: { editor?: ReactNode }) {
@@ -23,11 +21,6 @@ export function Workbench({ editor }: { editor?: ReactNode }) {
   const panelOpen = useIde((s) => s.panelOpen);
   const session = useIde((s) => s.session);
   const search = useProjectSearch();
-
-  // Narrow screens start with the side bar and panel closed.
-  useEffect(() => {
-    if (window.matchMedia(PHONE).matches) ide.set({ sideOpen: false, panelOpen: false });
-  }, []);
 
   useEffect(() => {
     if (sideOpen) main.expand('side');

@@ -2,6 +2,13 @@ import { create } from 'zustand';
 import type { BuildResult, DebugState, DisasmLine, LogicChannel, MemoryReadResult, PeripheralSnapshot, SymbolInfo, UvProject, WatchEval } from '../host/types';
 import { normPath } from '../lib/format';
 
+/** Phone breakpoint; keep in sync with the `max-width: 720px` block in styles/app.css. */
+export const PHONE_QUERY = '(max-width: 720px)';
+
+export function isNarrowScreen(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia?.(PHONE_QUERY).matches === true;
+}
+
 export interface Doc {
   path: string;
   content: string;
@@ -142,8 +149,9 @@ export const useIde = create<IdeState>()(() => ({
 
   status: 'Ready',
   theme: 'system',
-  sideOpen: true,
-  panelOpen: true,
+  // Phones start with the side bar and panel closed so the editor gets the width.
+  sideOpen: !isNarrowScreen(),
+  panelOpen: !isNarrowScreen(),
   disasmOpen: true,
 
   dialog: null,
