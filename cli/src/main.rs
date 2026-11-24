@@ -44,7 +44,7 @@ enum Commands {
         dir: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = "STM32F100RB")]
+        #[arg(long, default_value = "STM32F103C8")]
         device: String,
         #[arg(long, default_value = "asm")]
         template: String,

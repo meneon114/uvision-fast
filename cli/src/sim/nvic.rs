@@ -112,7 +112,7 @@ impl Nvic {
             EXC_NMI => -2,
             EXC_HARDFAULT => -1,
             4..=15 => self.shpr[exc - 4] as i32,
-            _ if exc >= 16 && exc < NUM_EXC => self.ipr[exc - 16] as i32,
+            _ if (16..NUM_EXC).contains(&exc) => self.ipr[exc - 16] as i32,
             _ => 256,
         }
     }
@@ -294,7 +294,7 @@ impl Nvic {
             w
         };
         match off {
-            0x004 => ((NUM_IRQ as u32 + 31) / 32).saturating_sub(1), // ICTR
+            0x004 => (NUM_IRQ as u32).div_ceil(32).saturating_sub(1), // ICTR
             0x100..=0x17F => {
                 let n = ((off - 0x100) / 4) as usize;
                 word_bits(&self.enabled, 16 + n * 32)

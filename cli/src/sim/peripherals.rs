@@ -401,11 +401,10 @@ impl GpioPort {
                 self.odr = (self.odr & !reset_bits) | set_bits;
             }
             0x14 => self.odr &= !(val & 0xFFFF),
-            0x18 => {
-                if !locked {
+            0x18
+                if !locked => {
                     self.lckr = val & 0x1_FFFF;
                 }
-            }
             _ => {}
         }
         self.refresh_idr();
@@ -1333,6 +1332,8 @@ impl Peripherals {
     }
 
     /// Read a 32-bit register. `None` = bus error. `side_effects = false` for debugger reads.
+    // Arms are ordered from specific to general; the catch-all ranges overlap on purpose.
+    #[allow(clippy::match_overlapping_arm)]
     pub fn read(&mut self, addr: u32, side_effects: bool) -> Option<u32> {
         let addr = addr & !3;
         let v = match addr {
@@ -1399,6 +1400,8 @@ impl Peripherals {
     }
 
     /// Write a register. `mask` marks the byte lanes being written. Returns false on a bus error.
+    // Arms are ordered from specific to general; the catch-all ranges overlap on purpose.
+    #[allow(clippy::match_overlapping_arm)]
     pub fn write(&mut self, addr: u32, val: u32, mask: u32) -> bool {
         let addr = addr & !3;
         let merge = |old: u32| (old & !mask) | (val & mask);

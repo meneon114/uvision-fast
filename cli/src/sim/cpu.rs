@@ -775,9 +775,9 @@ impl Cpu {
                 }
                 let mut vals = [0u32; 16];
                 let mut a = start;
-                for r in 0..16 {
+                for (r, v) in vals.iter_mut().enumerate() {
                     if regs & (1 << r) != 0 {
-                        vals[r] = self.mem_read(mem, a, 4, false)?;
+                        *v = self.mem_read(mem, a, 4, false)?;
                         a = a.wrapping_add(4);
                     }
                 }

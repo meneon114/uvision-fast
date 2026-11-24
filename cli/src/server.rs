@@ -77,7 +77,7 @@ impl ServerState {
                     .get("device")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("STM32F100RB");
+                    .unwrap_or("STM32F103C8");
                 let template = params
                     .get("template")
                     .and_then(|v| v.as_str())
