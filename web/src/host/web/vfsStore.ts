@@ -265,9 +265,7 @@ export class VirtualFsStore {
 
 export function triggerDownload(filename: string, data: string | Uint8Array, mime = 'application/octet-stream'): void {
   const copy = typeof data === 'string' ? undefined : new Uint8Array(data);
-  const blob = typeof data === 'string'
-    ? new Blob([data], { type: mime })
-    : new Blob([copy!.buffer], { type: mime });
+  const blob = typeof data === 'string' ? new Blob([data], { type: mime }) : new Blob([copy!.buffer], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

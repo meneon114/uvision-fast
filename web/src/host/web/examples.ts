@@ -1,6 +1,9 @@
+import { LAB_EXAMPLES } from './labs';
+
 export interface ExampleSpec {
   id: string;
   title: string;
+  lab: string;
   description: string;
   entryPath: string;
   files: Record<string, string>;
@@ -238,9 +241,11 @@ STOP
 `;
 
 export const STARTER_EXAMPLES: ExampleSpec[] = [
+  ...LAB_EXAMPLES,
   {
     id: 'starter_lab',
-    title: 'Starter Lab - Cortex-M3 Sum & SRAM (.uvprojx)',
+    title: 'Sum and SRAM store',
+    lab: 'Starter',
     description: 'Full Keil .uvprojx project summing 1..10 and writing partial sums into SRAM 0x20000000.',
     entryPath: '/Starter_Lab/Starter_Lab.uvprojx',
     files: {
@@ -250,7 +255,8 @@ export const STARTER_EXAMPLES: ExampleSpec[] = [
   },
   {
     id: 'gpio_uart',
-    title: 'STM32F1 GPIO + USART1 + Logic Analyzer',
+    title: 'GPIO and USART1',
+    lab: 'Starter',
     description: 'Drives PA0/PA1 LEDs in System Viewer -> GPIOA and prints "HELLO STM32!" to UART #1.',
     entryPath: '/Examples/GPIO_UART_Demo.s',
     files: {
@@ -259,7 +265,8 @@ export const STARTER_EXAMPLES: ExampleSpec[] = [
   },
   {
     id: 'bitshift',
-    title: 'Barrel Shifter (LSL/LSR/ASR/ROR) & Literal Pool',
+    title: 'Barrel shifter',
+    lab: 'Starter',
     description: 'Demonstrates 32-bit Thumb-2 immediate shifts, APSR flags, and LDR =0x12345678 literal pools.',
     entryPath: '/Examples/BitShift_Demo.s',
     files: {
@@ -268,7 +275,8 @@ export const STARTER_EXAMPLES: ExampleSpec[] = [
   },
   {
     id: 'timer_tim2',
-    title: 'STM32F1 TIM2 Hardware Timer Counter',
+    title: 'TIM2 counter',
+    lab: 'Starter',
     description: 'Enables TIM2 via RCC_APB1ENR, counts cycles, and snapshots TIM2->CNT into SRAM.',
     entryPath: '/Examples/Timer_Array_Demo.s',
     files: {

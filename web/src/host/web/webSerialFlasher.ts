@@ -62,11 +62,7 @@ export function isWebSerialSupported(): boolean {
   return typeof navigator !== 'undefined' && 'serial' in navigator;
 }
 
-export async function flashStm32ViaWebSerial(
-  firmwareBin: Uint8Array,
-  baseAddr: number,
-  onProgress: (p: Stm32FlashProgress) => void
-): Promise<void> {
+export async function flashStm32ViaWebSerial(firmwareBin: Uint8Array, baseAddr: number, onProgress: (p: Stm32FlashProgress) => void): Promise<void> {
   if (!isWebSerialSupported()) {
     throw new Error('WebSerial API is not supported in this browser. Use Chromium / Chrome / Edge over HTTPS or localhost.');
   }
@@ -105,7 +101,11 @@ export async function flashStm32ViaWebSerial(
       const [idN] = await reader.readBytes(1);
       const idBytes = await reader.readBytes(idN + 1);
       await reader.waitAck('GET ID tail');
-      chipIdHex = '0x' + Array.from(idBytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+      chipIdHex =
+        '0x' +
+        Array.from(idBytes)
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
     } catch {
       // optional
     }
@@ -140,12 +140,7 @@ export async function flashStm32ViaWebSerial(
       chunk.set(rawChunk);
 
       const addr = (baseAddr + offset) >>> 0;
-      const addrBytes = [
-        (addr >>> 24) & 0xff,
-        (addr >>> 16) & 0xff,
-        (addr >>> 8) & 0xff,
-        addr & 0xff,
-      ];
+      const addrBytes = [(addr >>> 24) & 0xff, (addr >>> 16) & 0xff, (addr >>> 8) & 0xff, addr & 0xff];
       const addrCsum = addrBytes[0] ^ addrBytes[1] ^ addrBytes[2] ^ addrBytes[3];
 
       await send([0x31, 0xce]);
@@ -175,12 +170,7 @@ export async function flashStm32ViaWebSerial(
 
     // 6. Jump to Reset vector (Go command 0x21)
     const goAddr = baseAddr >>> 0;
-    const goBytes = [
-      (goAddr >>> 24) & 0xff,
-      (goAddr >>> 16) & 0xff,
-      (goAddr >>> 8) & 0xff,
-      goAddr & 0xff,
-    ];
+    const goBytes = [(goAddr >>> 24) & 0xff, (goAddr >>> 16) & 0xff, (goAddr >>> 8) & 0xff, goAddr & 0xff];
     const goCsum = goBytes[0] ^ goBytes[1] ^ goBytes[2] ^ goBytes[3];
     await send([0x21, 0xde]);
     await reader.waitAck('GO cmd');
@@ -193,8 +183,12 @@ export async function flashStm32ViaWebSerial(
       log: `Flashed ${total} bytes to 0x${baseAddr.toString(16).toUpperCase()} and jumped to application.`,
     });
   } finally {
-    try { writer.releaseLock(); } catch {}
+    try {
+      writer.releaseLock();
+    } catch {}
     reader.release();
-    try { await port.close(); } catch {}
+    try {
+      await port.close();
+    } catch {}
   }
 }
