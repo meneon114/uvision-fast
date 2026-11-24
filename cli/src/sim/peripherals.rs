@@ -612,6 +612,9 @@ impl TimerState {
                         if self.cr1 & (1 << 2) == 0 {
                             self.sr |= 1;
                         }
+                        if self.cr1 & (1 << 3) != 0 {
+                            self.cr1 &= !1; // one-pulse mode: the update event clears CEN
+                        }
                     }
                     if self.center() {
                         self.cr1 &= !(1 << 4);
@@ -670,9 +673,17 @@ impl TimerState {
             if self.cnt != self.ccr_active[ch] {
                 continue;
             }
-            self.sr |= 1 << (ch + 1);
             if !self.is_output_channel(ch) {
-                continue;
+                continue; // an input channel flags captures, not counter matches
+            }
+            // center-aligned mode 1 flags matches only while counting down, mode 2 only up
+            let flag = match (self.cr1 >> 5) & 3 {
+                1 => self.down(),
+                2 => !self.down(),
+                _ => true,
+            };
+            if flag {
+                self.sr |= 1 << (ch + 1);
             }
             match self.oc_mode(ch) {
                 1 => self.oc_ref[ch] = true,

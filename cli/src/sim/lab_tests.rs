@@ -804,3 +804,74 @@ fn chip_output_beats_an_external_stimulus_on_a_linked_wire() {
     sim.connect_pins("PA0", "PA4", true).unwrap();
     assert_eq!(sim.mem.peripherals.gpios[PA].idr & 0x11, 0x11, "PA0 drives the wire high; the stimulus is weak");
 }
+
+/// TIM2 clock on, then `setup` with r0 = TIM2 base, then an idle loop.
+fn tim2_prog(setup: &str) -> String {
+    format!(
+        "    AREA main, CODE, READONLY
+    EXPORT _main
+    ENTRY
+_main PROC
+    LDR r2, =0x4002101C         ; RCC_APB1ENR
+    MOVS r1, #1
+    STR r1, [r2]
+    LDR r0, =0x40000000
+{setup}spin
+    B spin
+    ENDP
+    END
+"
+    )
+}
+
+#[test]
+fn ug_in_one_pulse_mode_stops_the_counter() {
+    let src = tim2_prog(
+        "    MOVS r1, #100
+    STR r1, [r0, #0x2C]         ; ARR
+    MOVS r1, #9
+    STR r1, [r0, #0x00]         ; OPM | CEN
+    NOP
+    NOP
+    NOP
+    MOVS r1, #1
+    STR r1, [r0, #0x14]         ; EGR.UG: an update event
+",
+    );
+    let mut sim = boot_to_main(&src);
+    let spin = sim.elf.sym_by_name["spin"] & !1;
+    run_until(&mut sim, 1000, |s| s.cpu.r[15] == spin).unwrap();
+    run_for(&mut sim, 50);
+    let t = &sim.mem.peripherals.timers[1];
+    assert_eq!(t.cr1 & 1, 0, "the update event cleared CEN in one-pulse mode");
+    assert_eq!(t.cnt, 0, "the counter stays at the UG reset value");
+    assert_ne!(t.sr & 1, 0, "UIF");
+}
+
+#[test]
+fn center_aligned_mode_1_flags_compare_matches_only_counting_down() {
+    let src = tim2_prog(
+        "    MOVS r1, #200
+    STR r1, [r0, #0x2C]         ; ARR
+    MOVS r1, #100
+    STR r1, [r0, #0x34]         ; CCR1
+    MOVS r1, #0x30
+    STR r1, [r0, #0x18]         ; CCMR1: OC1 toggle
+    MOVS r1, #0x21
+    STR r1, [r0, #0x00]         ; CMS = 01, CEN
+",
+    );
+    let mut sim = boot_to_main(&src);
+    let up_past = run_until(&mut sim, 2000, |s| {
+        let t = &s.mem.peripherals.timers[1];
+        t.cr1 & 0x10 == 0 && t.cnt > 110
+    });
+    assert!(up_past.is_some(), "counted up past CCR1");
+    assert_eq!(sim.mem.peripherals.timers[1].sr & 2, 0, "no CC1IF on the upward match");
+    let down_past = run_until(&mut sim, 2000, |s| {
+        let t = &s.mem.peripherals.timers[1];
+        t.cr1 & 0x10 != 0 && t.cnt < 90
+    });
+    assert!(down_past.is_some(), "counted back down past CCR1");
+    assert_ne!(sim.mem.peripherals.timers[1].sr & 2, 0, "CC1IF on the downward match");
+}
