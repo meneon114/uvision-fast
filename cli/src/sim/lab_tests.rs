@@ -465,6 +465,18 @@ exti_done
 "#;
 
 #[test]
+fn a_strong_handler_replaces_the_weak_startup_stub_by_name() {
+    let mut sim = boot(LAB5_EXTI);
+    let named: Vec<_> = sim.elf.symbols.iter().filter(|s| s.name == "EXTI0_IRQHandler").collect();
+    assert_eq!(named.len(), 1, "only the student's handler carries the name");
+    let addr = sim.elf.symbol_addr("EXTI0_IRQHandler").unwrap();
+    assert_eq!(addr, sim.elf.sym_by_name["EXTI0_IRQHandler"] & !1);
+    assert_ne!(sim.mem.read16(addr), 0xE7FE, "not the `B .` stub");
+    let vector = sim.mem.read32(0x0800_0000 + 4 * (16 + 6));
+    assert_eq!(vector & !1, addr, "the vector table points at the same handler");
+}
+
+#[test]
 fn lab5_exp2_exti0_follows_button_edges() {
     let mut sim = boot_to_main(LAB5_EXTI);
     let idle = sim.elf.sym_by_name["idle"] & !1;

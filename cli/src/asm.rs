@@ -1756,6 +1756,9 @@ pub fn assemble_sources(
                 continue;
             }
             let SymDef::Label(s) = &f.syms[name] else { continue };
+            if f.weak.contains(name) && asm.strong.get(name).is_some_and(|&g| g != fi) {
+                continue; // a weak default (e.g. a startup stub) replaced by a strong definition
+            }
             let st = &asm.stmts[*s];
             let thumb = matches!(st.body, Body::Insn { .. });
             let sec = match asm.areas[st.area].kind {

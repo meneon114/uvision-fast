@@ -61,9 +61,14 @@ pub struct LoadedElf {
 }
 
 impl LoadedElf {
-    /// Address of a symbol with the Thumb bit removed from code symbols only.
+    /// Address of a symbol with the Thumb bit removed from code symbols only. A global
+    /// definition wins over a file-local label of the same name.
     pub fn symbol_addr(&self, name: &str) -> Option<u32> {
-        self.symbols.iter().find(|s| s.name == name).map(|s| s.addr)
+        let raw = *self.sym_by_name.get(name)?;
+        self.symbols
+            .iter()
+            .find(|s| s.name == name && (s.addr == raw || (s.is_func && s.addr == raw & !1)))
+            .map(|s| s.addr)
     }
 }
 
@@ -137,6 +142,7 @@ impl LoadedElf {
 
         let mut symbols = Vec::new();
         let mut sym_by_name = HashMap::new();
+        let mut global_names = std::collections::HashSet::new();
         let mut mapping = Vec::new();
         for sym in obj.symbols() {
             let Ok(name) = sym.name() else { continue };
@@ -161,7 +167,13 @@ impl LoadedElf {
             };
             let addr = if is_func { raw_addr & !1 } else { raw_addr };
             let size = sym.size() as u32;
-            sym_by_name.entry(name.to_string()).or_insert(raw_addr);
+            if sym.is_global() {
+                if global_names.insert(name.to_string()) {
+                    sym_by_name.insert(name.to_string(), raw_addr);
+                }
+            } else if !global_names.contains(name) {
+                sym_by_name.entry(name.to_string()).or_insert(raw_addr);
+            }
             symbols.push(ElfSymbol {
                 name: name.to_string(),
                 addr,
