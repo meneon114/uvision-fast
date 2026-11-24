@@ -1,0 +1,398 @@
+//! Cortex-M3 core tests written as assembly programs: flags, IT blocks, exception entry and
+//! return (stack alignment, EXC_RETURN), NVIC priorities, PRIMASK/BASEPRI, preemption,
+//! tail-chaining, level-sensitive re-entry and UNDEFINED encodings.
+
+use super::lab_tests::{boot, run_until};
+use crate::sim::cpu::HaltReason;
+use crate::sim::Simulator;
+
+/// Run until BKPT; panics on a fault or if BKPT is not reached.
+fn run_to_bkpt(sim: &mut Simulator) {
+    for _ in 0..2_000_000 {
+        sim.cpu.halted_reason = HaltReason::Running;
+        sim.cpu.step(&mut sim.mem);
+        match &sim.cpu.halted_reason {
+            HaltReason::Bkpt(_) => return,
+            HaltReason::Fault(f) => panic!("fault at 0x{:08X}: {}", sim.cpu.r[15], f),
+            _ => {}
+        }
+    }
+    panic!("BKPT not reached; pc=0x{:08X}", sim.cpu.r[15]);
+}
+
+fn prog(body: &str, extra: &str) -> String {
+    format!(
+        "    AREA main, CODE, READONLY\n    EXPORT _main\n{extra}    ENTRY\n_main PROC\n{body}\n    BKPT #0\n    ENDP\n    END\n"
+    )
+}
+
+const N: u32 = 1 << 31;
+const Z: u32 = 1 << 30;
+const C: u32 = 1 << 29;
+const V: u32 = 1 << 28;
+const Q: u32 = 1 << 27;
+
+#[test]
+fn flags_and_arithmetic() {
+    let src = prog(
+        "
+    LDR r0, =0x7FFFFFFF
+    ADDS r0, r0, #1             ; signed overflow
+    MRS r8, APSR
+    MOVS r1, #0
+    SUBS r1, r1, #1             ; borrow: C clear
+    MRS r9, APSR
+    CMP r1, r1                  ; equal: Z and C set
+    MRS r10, APSR
+    LDR r2, =0xFFFFFFFF         ; 64-bit add 0x00000001_FFFFFFFF + 1
+    MOVS r3, #1
+    ADDS r2, r2, #1
+    ADC r3, r3, #0
+    LDR r4, =0x80000001
+    ASRS r5, r4, #32            ; all sign bits, C = bit 31
+    MRS r11, APSR
+    LSLS r6, r4, #1             ; C = old bit 31
+    MRS r12, APSR
+    MOVS r7, #0
+    UDIV r7, r4, r7             ; divide by zero gives 0 (DIV_0_TRP clear)
+    LDR r0, =0x12345
+    SSAT r0, #8, r0             ; saturates to 127, sets Q
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    let r = sim.cpu.r;
+    assert_eq!(r[8] & (N | Z | C | V), N | V, "0x7FFFFFFF + 1");
+    assert_eq!(r[9] & (N | Z | C | V), N, "0 - 1");
+    assert_eq!(r[10] & (N | Z | C | V), Z | C, "CMP equal");
+    assert_eq!((r[2], r[3]), (0, 2), "carry into the high word");
+    assert_eq!(r[5], 0xFFFF_FFFF);
+    assert_eq!(r[11] & (N | C), N | C);
+    assert_eq!(r[6], 2);
+    assert_eq!(r[12] & (N | Z | C), C);
+    assert_eq!(r[7], 0);
+    assert_eq!(r[0], 127);
+    assert_ne!(sim.cpu.xpsr & Q, 0, "SSAT sets the sticky Q flag");
+}
+
+#[test]
+fn it_blocks_condition_and_flag_setting() {
+    let src = prog(
+        "
+    MOVS r0, #1
+    MOVS r1, #0
+    MOVS r2, #0
+    MOVS r3, #0
+    CMP r0, #1                  ; Z = 1
+    ITTEE EQ
+    MOVEQ r1, #11               ; executed
+    ADDEQ r2, r2, #5            ; executed
+    MOVNE r3, #7                ; skipped
+    ADDNE r3, r3, #1            ; skipped
+    MOVS r4, #0
+    CMP r4, #0                  ; Z = 1, C = 1
+    IT EQ
+    ADDEQ r4, r4, r0            ; 16-bit ADD inside IT does not set flags
+    MRS r5, APSR
+    CMP r0, #2                  ; NE
+    ITE NE
+    MOVNE r6, #1
+    BEQ fail                    ; last in IT: not taken
+    MOVS r7, #0x55
+    B done
+fail
+    MOVS r7, #0xEE
+done
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    let r = sim.cpu.r;
+    assert_eq!((r[1], r[2], r[3]), (11, 5, 0));
+    assert_eq!(r[4], 1);
+    assert_eq!(r[5] & (N | Z | C), Z | C, "flags unchanged by ADDEQ in IT");
+    assert_eq!(r[6], 1);
+    assert_eq!(r[7], 0x55);
+    assert_eq!(sim.cpu.xpsr & 0x0600_FC00, 0, "ITSTATE cleared after the block");
+}
+
+#[test]
+fn exception_entry_realigns_stack_and_returns() {
+    let src = prog(
+        "
+    SUB sp, sp, #4              ; SP is now 4 mod 8
+    MOV r0, sp
+    MOVS r5, #0x5A
+    SVC #1
+    MOV r1, sp
+    ADD sp, sp, #4
+",
+        "    EXPORT SVC_Handler\n",
+    ) + "";
+    let src = src.replace(
+        "    END\n",
+        "SVC_Handler PROC
+    MOV r8, sp
+    LDR r9, [sp, #28]           ; stacked xPSR
+    MOV r10, lr                 ; EXC_RETURN
+    LDR r11, [sp, #24]          ; stacked return address
+    MRS r6, IPSR
+    MOVS r5, #0                 ; not part of the frame: stays 0 after return
+    MOVS r0, #0                 ; part of the frame: restored on return
+    BX lr
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    let r = sim.cpu.r;
+    assert_eq!(r[0] % 8, 4, "r0 restored from the frame");
+    assert_eq!(r[8], (r[0] - 32) & !7, "frame realigned to 8 bytes");
+    assert_ne!(r[9] & (1 << 9), 0, "stacked xPSR bit 9 records the realignment");
+    assert_eq!(r[10], 0xFFFF_FFF9, "return to Thread mode, MSP");
+    assert_eq!(r[6], 11, "IPSR = SVCall");
+    assert_eq!(r[1], r[0], "SP restored exactly on return");
+    let svc = sim.elf.symbols.iter().find(|s| s.name == "_main").unwrap().addr;
+    assert!(r[11] > svc && r[11] & 1 == 0, "stacked PC = instruction after SVC, no Thumb bit");
+    assert_eq!(r[5], 0, "registers outside the frame keep the handler's value");
+    assert_eq!(sim.cpu.xpsr & 0x1FF, 0, "back in Thread mode");
+}
+
+const NVIC_PROG: &str = r#"
+NVIC_ISER0 EQU 0xE000E100
+NVIC_ISPR0 EQU 0xE000E200
+NVIC_IPR   EQU 0xE000E400
+
+    AREA vars, DATA, READWRITE
+log_idx  SPACE 4
+nest_flag SPACE 4
+log_buf  SPACE 64
+
+    AREA main, CODE, READONLY
+    EXPORT _main
+    EXPORT EXTI0_IRQHandler
+    EXPORT EXTI1_IRQHandler
+    ENTRY
+
+_main PROC
+    LDR r0, =NVIC_IPR
+    MOVS r1, #0x80
+    STRB r1, [r0, #6]           ; EXTI0 (IRQ 6): priority 0x80
+    MOVS r1, #0x40
+    STRB r1, [r0, #7]           ; EXTI1 (IRQ 7): priority 0x40 (more urgent)
+    LDR r0, =NVIC_ISER0
+    MOVS r1, #0xC0
+    STR r1, [r0]
+    LDR r4, =NVIC_ISPR0
+
+    ; 1: PRIMASK holds a pending interrupt back
+    CPSID i
+    MOVS r1, #0x40
+    STR r1, [r4]
+    MOVS r0, #0xA1
+    BL log
+    CPSIE i
+    MOVS r0, #0xA2
+    BL log
+
+    ; 2: BASEPRI masks priority >= 0x80 only
+    MOVS r0, #0x80
+    MSR BASEPRI, r0
+    MOVS r1, #0xC0
+    STR r1, [r4]
+    MOVS r0, #0xA3
+    BL log
+    MOVS r0, #0
+    MSR BASEPRI, r0
+    MOVS r0, #0xA4
+    BL log
+
+    ; 3: two pending: the more urgent first, then tail-chain into the other
+    CPSID i
+    MOVS r1, #0xC0
+    STR r1, [r4]
+    CPSIE i
+    MOVS r0, #0xA5
+    BL log
+
+    ; 4: EXTI1 pended inside the EXTI0 handler preempts it
+    LDR r0, =nest_flag
+    MOVS r1, #1
+    STR r1, [r0]
+    MOVS r1, #0x40
+    STR r1, [r4]
+    MOVS r0, #0xA6
+    BL log
+    BKPT #0
+    ENDP
+
+EXTI0_IRQHandler PROC
+    PUSH {r4, lr}
+    MOVS r0, #6
+    BL log
+    LDR r0, =nest_flag
+    LDR r1, [r0]
+    CBZ r1, exti0_end
+    MOVS r1, #0
+    STR r1, [r0]
+    LDR r0, =NVIC_ISPR0
+    MOVS r1, #0x80
+    STR r1, [r0]
+    DSB
+    ISB
+exti0_end
+    MOVS r0, #0x16
+    BL log
+    POP {r4, pc}
+    ENDP
+
+EXTI1_IRQHandler PROC
+    PUSH {r4, lr}
+    MOVS r0, #7
+    BL log
+    POP {r4, pc}
+    ENDP
+
+log PROC
+    LDR r1, =log_idx
+    LDR r2, [r1]
+    LDR r3, =log_buf
+    STRB r0, [r3, r2]
+    ADDS r2, r2, #1
+    STR r2, [r1]
+    BX lr
+    ENDP
+    END
+"#;
+
+#[test]
+fn nvic_priorities_masking_preemption_and_tail_chaining() {
+    let mut sim = boot(NVIC_PROG);
+    run_to_bkpt(&mut sim);
+    let idx = sim.elf.sym_by_name["log_idx"];
+    let buf = sim.elf.sym_by_name["log_buf"];
+    let n = sim.mem.read32(idx);
+    let log: Vec<u8> = (0..n).map(|i| sim.mem.read8(buf + i)).collect();
+    assert_eq!(
+        log,
+        vec![
+            0xA1, 6, 0x16, 0xA2, // PRIMASK
+            7, 0xA3, 6, 0x16, 0xA4, // BASEPRI
+            7, 6, 0x16, 0xA5, // priority order + tail-chain
+            6, 7, 0x16, 0xA6, // preemption
+        ]
+    );
+}
+
+#[test]
+fn tail_chain_skips_unstacking() {
+    // with both pending, the second handler is entered straight from the first one's
+    // exception return: 6-cycle tail-chain instead of 12-cycle unstack + 12-cycle stack
+    let mut sim = boot(NVIC_PROG);
+    let e0 = sim.elf.sym_by_name["EXTI0_IRQHandler"] & !1;
+    let e1 = sim.elf.sym_by_name["EXTI1_IRQHandler"] & !1;
+    // skip scenarios 1 and 2
+    let mut seen = 0;
+    run_until(&mut sim, 1_000_000, |s| {
+        if s.cpu.r[15] == e1 {
+            seen += 1;
+        }
+        seen == 2
+    })
+    .expect("EXTI1 entered for scenario 3");
+    let mut in_thread = false;
+    let mut last_pc = 0;
+    run_until(&mut sim, 10_000, |s| {
+        if s.cpu.xpsr & 0x1FF == 0 {
+            in_thread = true;
+        }
+        let hit = s.cpu.r[15] == e0 && last_pc != e0;
+        last_pc = s.cpu.r[15];
+        hit
+    })
+    .expect("EXTI0 tail-chained");
+    assert!(!in_thread, "no Thread-mode instruction between the two handlers");
+    assert_eq!(sim.cpu.xpsr & 0x1FF, 22);
+}
+
+#[test]
+fn level_sensitive_irq_reenters_until_source_cleared() {
+    // EXTI pending bit not cleared -> the NVIC line stays high -> handler re-entered
+    let src = r#"
+EXTI_BASE  EQU 0x40010400
+    AREA vars, DATA, READWRITE
+count SPACE 4
+    AREA main, CODE, READONLY
+    EXPORT _main
+    EXPORT EXTI0_IRQHandler
+    ENTRY
+_main PROC
+    LDR r0, =0x40021018
+    MOVS r1, #1                 ; AFIO clock
+    STR r1, [r0]
+    LDR r0, =EXTI_BASE
+    MOVS r1, #1
+    STR r1, [r0]                ; IMR0
+    LDR r2, =0xE000E100
+    MOVS r3, #(1 << 6)
+    STR r3, [r2]                ; enable EXTI0
+    STR r1, [r0, #0x10]         ; SWIER0: software trigger
+    NOP
+    BKPT #0
+    ENDP
+EXTI0_IRQHandler PROC
+    LDR r0, =count
+    LDR r1, [r0]
+    ADDS r1, r1, #1
+    STR r1, [r0]
+    CMP r1, #3
+    BLO keep
+    LDR r0, =EXTI_BASE
+    MOVS r1, #1
+    STR r1, [r0, #0x14]         ; clear PR0 on the third run
+    DSB
+keep
+    BX lr
+    ENDP
+    END
+"#;
+    let mut sim = boot(src);
+    run_to_bkpt(&mut sim);
+    let count = sim.mem.read32(sim.elf.sym_by_name["count"]);
+    assert_eq!(count, 3);
+    assert_eq!(sim.mem.peripherals.exti.pr, 0);
+}
+
+#[test]
+fn undefined_wide_store_encoding_faults() {
+    // F9C0 1000 is STR.W with the signed bit set: UNDEFINED, not a store
+    let src = prog(
+        "
+    LDR r0, =0x20000000
+    MOVS r1, #0x77
+    DCW 0xF9C0, 0x1000
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    let hf = sim.elf.sym_by_name["HardFault_Handler"] & !1;
+    // the simulator stops like a debugger when the fault escalates; keep stepping through it
+    let mut taken = false;
+    for _ in 0..1_000_000 {
+        sim.cpu.halted_reason = HaltReason::Running;
+        sim.cpu.step(&mut sim.mem);
+        if sim.cpu.r[15] == hf {
+            taken = true;
+            break;
+        }
+    }
+    assert!(taken, "HardFault taken");
+    let cfsr = sim.mem.read32(0xE000_ED28);
+    let hfsr = sim.mem.read32(0xE000_ED2C);
+    assert_ne!(cfsr & (1 << 16), 0, "UFSR.UNDEFINSTR");
+    assert_ne!(hfsr & (1 << 30), 0, "HFSR.FORCED (UsageFault disabled)");
+    assert_ne!(sim.mem.read32(0x2000_0000), 0x77, "nothing was stored");
+}

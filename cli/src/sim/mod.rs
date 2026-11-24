@@ -3,6 +3,11 @@ pub mod memory;
 pub mod nvic;
 pub mod peripherals;
 
+#[cfg(test)]
+mod core_tests;
+#[cfg(test)]
+mod lab_tests;
+
 use crate::elf::{DisasmLine, LoadedElf};
 use crate::sim::cpu::{is_thumb32, Cpu, HaltReason};
 use crate::sim::memory::{DeviceMap, Memory};
@@ -554,6 +559,14 @@ impl DebugTarget for Simulator {
         }
     }
 
+    fn connect_pins(&mut self, a: &str, b: &str, connected: bool) -> Result<()> {
+        let pa = parse_pin_name(a).ok_or_else(|| anyhow!("Bad pin name '{}' (expected e.g. PA0)", a))?;
+        let pb = parse_pin_name(b).ok_or_else(|| anyhow!("Bad pin name '{}' (expected e.g. PA4)", b))?;
+        self.mem.peripherals.set_pin_link(pa, pb, connected);
+        self.record_logic_points();
+        Ok(())
+    }
+
     fn uart_send(&mut self, text: &str) -> Result<()> {
         self.mem.peripherals.usarts[0].push_rx_bytes(text.as_bytes());
         Ok(())
@@ -573,6 +586,23 @@ impl DebugTarget for Simulator {
     fn logic_samples(&mut self) -> Result<Vec<LogicChannel>> {
         Ok(self.logic.channels.clone())
     }
+}
+
+/// `"PA0"`, `"pc15"`, `"GPIOB.3"` -> (port index, pin).
+pub fn parse_pin_name(s: &str) -> Option<(u8, u8)> {
+    let u = s.trim().to_ascii_uppercase();
+    let (port, pin) = if let Some(rest) = u.strip_prefix("GPIO") {
+        let (p, n) = rest.split_once('.').unwrap_or((&rest[..1.min(rest.len())], rest.get(1..).unwrap_or("")));
+        (p.chars().next()?, n.to_string())
+    } else {
+        let rest = u.strip_prefix('P')?;
+        (rest.chars().next()?, rest[1..].to_string())
+    };
+    if !('A'..='G').contains(&port) {
+        return None;
+    }
+    let pin: u8 = pin.parse().ok()?;
+    (pin < 16).then_some((port as u8 - b'A', pin))
 }
 
 pub fn parse_reg_name(upper: &str) -> Option<usize> {

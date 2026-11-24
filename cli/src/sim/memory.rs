@@ -122,8 +122,7 @@ impl Memory {
     pub fn reset_and_load(&mut self, elf: &LoadedElf) {
         self.flash.fill(0xFF);
         self.sram.fill(0x00);
-        let hse = self.peripherals.rcc.hse_hz;
-        self.peripherals = Peripherals::new(hse);
+        self.reset_peripherals_keep_wiring(false);
         self.dirty_sram.clear();
         for seg in &elf.segments {
             for (i, &b) in seg.data.iter().enumerate() {
@@ -134,18 +133,29 @@ impl Memory {
 
     /// Peripheral-only reset (AIRCR.SYSRESETREQ): memory contents are kept.
     pub fn system_reset(&mut self) {
+        self.reset_peripherals_keep_wiring(true);
+    }
+
+    /// Reset every peripheral register while keeping what is outside the chip: buttons and
+    /// signals applied to pins and keypad wiring (and, for a system reset, the UART text
+    /// the terminal has shown so far).
+    fn reset_peripherals_keep_wiring(&mut self, keep_uart_text: bool) {
         let hse = self.peripherals.rcc.hse_hz;
         let gpio_ext: Vec<(u16, u16)> = self.peripherals.gpios.iter().map(|g| (g.ext_pins, g.ext_mask)).collect();
         let tx: Vec<Vec<u8>> = self.peripherals.usarts.iter().map(|u| u.tx_buffer.clone()).collect();
+        let links = std::mem::take(&mut self.peripherals.pin_links);
         self.peripherals = Peripherals::new(hse);
         for (g, (p, m)) in self.peripherals.gpios.iter_mut().zip(gpio_ext) {
             g.ext_pins = p;
             g.ext_mask = m;
-            g.refresh_idr();
         }
-        for (u, t) in self.peripherals.usarts.iter_mut().zip(tx) {
-            u.tx_buffer = t;
+        if keep_uart_text {
+            for (u, t) in self.peripherals.usarts.iter_mut().zip(tx) {
+                u.tx_buffer = t;
+            }
         }
+        self.peripherals.pin_links = links;
+        self.peripherals.update_pins();
     }
 
     fn flash_off(&self, addr: u32) -> Option<usize> {

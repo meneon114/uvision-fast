@@ -264,6 +264,12 @@ pub struct GpioPort {
     /// Physical pin levels.
     #[serde(default)]
     pub pins: u16,
+    /// Levels imposed through a pin link (a pressed keypad key shorting this input to
+    /// another chip pin that drives it). A link overrides a weak external pull.
+    #[serde(default)]
+    pub link_mask: u16,
+    #[serde(default)]
+    pub link_val: u16,
 }
 
 impl GpioPort {
@@ -280,6 +286,8 @@ impl GpioPort {
             af_val: 0,
             af_mask: 0,
             pins: 0,
+            link_mask: 0,
+            link_val: 0,
         };
         g.refresh_idr();
         g
@@ -298,6 +306,21 @@ impl GpioPort {
         self.pin_cfg(pin) & 3 != 0
     }
 
+    /// Level this pin actively drives onto its wire: push-pull outputs drive both levels,
+    /// open-drain outputs only drive low, inputs drive nothing.
+    pub fn driven_level(&self, pin: u32) -> Option<bool> {
+        let cfg = self.pin_cfg(pin);
+        if cfg & 3 == 0 {
+            return None;
+        }
+        let level = self.pins & (1 << pin) != 0;
+        if cfg & 4 != 0 && level {
+            None
+        } else {
+            Some(level)
+        }
+    }
+
     /// Recompute physical pin levels and IDR from configuration, ODR, AF outputs and
     /// external drivers.
     pub fn refresh_idr(&mut self) {
@@ -308,7 +331,13 @@ impl GpioPort {
             let cfg = self.pin_cfg(pin);
             let mode = cfg & 3;
             let cnf = cfg >> 2;
-            let ext = if self.ext_mask & b != 0 { Some(self.ext_pins & b != 0) } else { None };
+            let ext = if self.link_mask & b != 0 {
+                Some(self.link_val & b != 0)
+            } else if self.ext_mask & b != 0 {
+                Some(self.ext_pins & b != 0)
+            } else {
+                None
+            };
             let odr = self.odr as u16 & b != 0;
             let level = if mode == 0 {
                 match cnf {
@@ -696,6 +725,8 @@ impl TimerState {
                 continue; // the counter is blocked while the auto-reload value is 0
             }
             self.count_one();
+            // an update event may just have loaded a new prescaler from its preload register
+            let div = self.psc_active as u64 + 1;
             let skip = (tclk / div).min(self.quiet_counts());
             if skip > 0 && self.cr1 & 1 != 0 {
                 if self.down() {
@@ -1204,6 +1235,9 @@ pub struct Peripherals {
     pub clock_error: Option<String>,
     /// Current exception number (mirrors IPSR; needed for ICSR reads).
     pub ipsr: u32,
+    /// Wires between two chip pins, as (port, pin, port, pin): a pressed key of a matrix
+    /// keypad connects its row pin to its column pin.
+    pub pin_links: Vec<(u8, u8, u8, u8)>,
 }
 
 impl Default for Peripherals {
@@ -1245,6 +1279,7 @@ impl Peripherals {
             flash_acr: 0x0000_0030,
             clock_error: None,
             ipsr: 0,
+            pin_links: Vec::new(),
         }
     }
 
@@ -1615,7 +1650,43 @@ impl Peripherals {
             }
         }
         for g in &mut self.gpios {
+            g.link_mask = 0;
+            g.link_val = 0;
             g.refresh_idr();
+        }
+        if !self.pin_links.is_empty() {
+            // A driven pin imposes its level on an undriven pin at the other end of the wire;
+            // several drivers on one input resolve low-dominant (wired-AND).
+            let mut imposed: Vec<(usize, u32, bool)> = Vec::new();
+            for &(pa, na, pb, nb) in &self.pin_links {
+                let (pa, na, pb, nb) = (pa as usize, na as u32, pb as usize, nb as u32);
+                if pa >= 7 || pb >= 7 || na >= 16 || nb >= 16 {
+                    continue;
+                }
+                let da = self.gpios[pa].driven_level(na);
+                let db = self.gpios[pb].driven_level(nb);
+                match (da, db) {
+                    (Some(l), None) => imposed.push((pb, nb, l)),
+                    (None, Some(l)) => imposed.push((pa, na, l)),
+                    _ => {}
+                }
+            }
+            for &(port, pin, level) in &imposed {
+                let g = &mut self.gpios[port];
+                let b = 1u16 << pin;
+                if g.link_mask & b == 0 {
+                    g.link_mask |= b;
+                    g.link_val |= b;
+                }
+                if !level {
+                    g.link_val &= !b;
+                }
+            }
+            for g in &mut self.gpios {
+                if g.link_mask != 0 {
+                    g.refresh_idr();
+                }
+            }
         }
         // EXTI line x follows the pin selected by AFIO_EXTICR
         let mut lines = 0u16;
@@ -1636,6 +1707,18 @@ impl Peripherals {
     pub fn set_input_pin(&mut self, port: usize, pin: u8, high: bool) {
         if let Some(g) = self.gpios.get_mut(port) {
             g.set_ext_pin(pin, high);
+        }
+        self.update_pins();
+        self.update_irq_lines();
+    }
+
+    /// Connect (or disconnect) two chip pins, e.g. while a keypad key is held down.
+    pub fn set_pin_link(&mut self, a: (u8, u8), b: (u8, u8), connected: bool) {
+        let key = (a.0, a.1, b.0, b.1);
+        let rev = (b.0, b.1, a.0, a.1);
+        self.pin_links.retain(|&l| l != key && l != rev);
+        if connected {
+            self.pin_links.push(key);
         }
         self.update_pins();
         self.update_irq_lines();

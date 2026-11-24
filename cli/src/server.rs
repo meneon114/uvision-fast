@@ -409,6 +409,15 @@ impl ServerState {
                 Ok(serde_json::to_value(snap)?)
             }
 
+            "debug.connectPins" => {
+                let a = req_str(&params, "a")?;
+                let b = req_str(&params, "b")?;
+                let connected = params.get("connected").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.req_target()?.connect_pins(&a, &b, connected)?;
+                let snap = self.req_target()?.peripherals()?;
+                Ok(serde_json::to_value(snap)?)
+            }
+
             "debug.uartSend" => {
                 let text = req_str(&params, "text")?;
                 self.req_target()?.uart_send(&text)?;
