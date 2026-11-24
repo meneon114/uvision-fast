@@ -1,0 +1,93 @@
+{
+  "name": "uvision-fast",
+  "displayName": "uVision Fast (Keil µVision 5 IDE)",
+  "description": "Fast Keil µVision 5 replica IDE & ARM Cortex-M3 / STM32F1 simulator/hardware debugger backed by uvcli",
+  "version": "0.2.0",
+  "publisher": "ruet-cse3108",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Programming Languages",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node esbuild.mjs && tsc --noEmit",
+    "watch": "node esbuild.mjs --watch"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "uvision-fast.open",
+        "title": "uVision Fast: Open Keil µVision 5 IDE",
+        "icon": "$(circuit-board)"
+      },
+      {
+        "command": "uvision-fast.openFile",
+        "title": "uVision Fast: Open Current File/Project in µVision",
+        "icon": "$(circuit-board)"
+      },
+      {
+        "command": "uvision-fast.build",
+        "title": "uVision Fast: Build"
+      },
+      {
+        "command": "uvision-fast.debug",
+        "title": "uVision Fast: Start Debug"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "uvision-fast.openFile",
+          "when": "resourceExtname =~ /^\\.(s|S|asm|c|h|uvprojx)$/i",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "uvision-fast.openFile",
+          "when": "resourceExtname =~ /^\\.(s|S|asm|c|h|uvprojx)$/i",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "uVision Fast",
+      "properties": {
+        "uvisionFast.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to uvcli.exe (leave empty to auto-discover)"
+        },
+        "uvisionFast.keilRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Override Keil_v5 root path"
+        },
+        "uvisionFast.openocdPath": {
+          "type": "string",
+          "default": "",
+          "description": "Override openocd.exe path"
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.6.0",
+    "@codemirror/language": "^6.10.2",
+    "@codemirror/search": "^6.5.6",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/view": "^6.28.6",
+    "@lezer/highlight": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

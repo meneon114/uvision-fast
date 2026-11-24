@@ -1,0 +1,393 @@
+#[cfg(not(target_arch = "wasm32"))]
+use crate::toolchain::ToolchainInfo;
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
+use gimli::{EndianSlice, LittleEndian};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct ElfSegment {
+    pub vaddr: u32,
+    pub memsz: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElfSymbol {
+    pub name: String,
+    pub addr: u32,
+    pub size: u32,
+    pub is_func: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineEntry {
+    pub addr: u32,
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisasmLine {
+    pub addr: u32,
+    pub opcode: String,
+    pub mnemonic: String,
+    pub label: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedElf {
+    pub path: String,
+    pub entry: u32,
+    pub segments: Vec<ElfSegment>,
+    pub symbols: Vec<ElfSymbol>,
+    pub sym_by_name: HashMap<String, u32>,
+    pub lines: Vec<LineEntry>,
+    pub disassembly: Vec<DisasmLine>,
+}
+
+impl LoadedElf {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load(axf_path: &Path, tc: &ToolchainInfo) -> Result<Self> {
+        let bytes = std::fs::read(axf_path)
+            .with_context(|| format!("Failed reading ELF/AXF: {}", axf_path.display()))?;
+        let mut parsed = Self::parse_raw(&axf_path.to_string_lossy(), &bytes)?;
+        let mut disassembly = extract_disassembly(axf_path, tc, &parsed.lines, &parsed.symbols);
+        if disassembly.is_empty() {
+            disassembly = crate::disasm::disassemble_elf(
+                &parsed.segments,
+                &parsed.lines,
+                &parsed.symbols,
+                parsed.entry,
+            );
+        }
+        parsed.disassembly = disassembly;
+        Ok(parsed)
+    }
+
+    pub fn load_from_bytes(name: &str, bytes: &[u8]) -> Result<Self> {
+        let mut parsed = Self::parse_raw(name, bytes)?;
+        parsed.disassembly = crate::disasm::disassemble_elf(
+            &parsed.segments,
+            &parsed.lines,
+            &parsed.symbols,
+            parsed.entry,
+        );
+        Ok(parsed)
+    }
+
+    fn parse_raw(label: &str, bytes: &[u8]) -> Result<Self> {
+        let obj = object::File::parse(bytes)
+            .map_err(|e| anyhow!("Invalid ELF/AXF {}: {}", label, e))?;
+
+        let entry = obj.entry() as u32;
+        let mut segments = Vec::new();
+        for seg in obj.segments() {
+            let vaddr = seg.address() as u32;
+            let memsz = seg.size() as u32;
+            let data = seg.data().map(|d| d.to_vec()).unwrap_or_default();
+            if memsz > 0 {
+                segments.push(ElfSegment { vaddr, memsz, data });
+            }
+        }
+
+        let mut symbols = Vec::new();
+        let mut sym_by_name = HashMap::new();
+        for sym in obj.symbols() {
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() || name.starts_with('$') {
+                continue;
+            }
+            let raw_addr = sym.address() as u32;
+            let addr = raw_addr & !1;
+            let is_func = sym.kind() == SymbolKind::Text || (raw_addr & 1) == 1;
+            let size = sym.size() as u32;
+            sym_by_name.entry(name.to_string()).or_insert(raw_addr);
+            symbols.push(ElfSymbol {
+                name: name.to_string(),
+                addr,
+                size,
+                is_func,
+            });
+        }
+        symbols.sort_by_key(|s| (s.addr, s.name.clone()));
+
+        let lines = extract_dwarf_lines(&obj).unwrap_or_default();
+
+        Ok(Self {
+            path: label.to_string(),
+            entry,
+            segments,
+            symbols,
+            sym_by_name,
+            lines,
+            disassembly: Vec::new(),
+        })
+    }
+
+    pub fn line_for_addr(&self, addr: u32) -> Option<&LineEntry> {
+        let clean = addr & !1;
+        if self.lines.is_empty() {
+            return None;
+        }
+        let idx = self.lines.partition_point(|e| e.addr <= clean);
+        if idx == 0 {
+            return None;
+        }
+        let cand = &self.lines[idx - 1];
+        if clean.saturating_sub(cand.addr) <= 64 {
+            Some(cand)
+        } else {
+            None
+        }
+    }
+
+    pub fn addr_for_line(&self, file_query: &str, line: u32) -> Option<u32> {
+        let qnorm = normalize_path_cmp(file_query);
+        let qname = Path::new(&qnorm)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&qnorm)
+            .to_string();
+
+        // Exact path match first, then filename match
+        let mut exact: Option<u32> = None;
+        let mut by_name: Option<u32> = None;
+        for e in &self.lines {
+            let enorm = normalize_path_cmp(&e.file);
+            if e.line == line {
+                if enorm == qnorm {
+                    exact = Some(e.addr);
+                    break;
+                }
+                let ename = Path::new(&enorm)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&enorm);
+                if ename == qname && by_name.is_none() {
+                    by_name = Some(e.addr);
+                }
+            }
+        }
+        if exact.is_some() {
+            return exact;
+        }
+        if by_name.is_some() {
+            return by_name;
+        }
+
+        // Nearest line >= requested within same file (within 10 lines)
+        let mut best: Option<(u32, u32)> = None;
+        for e in &self.lines {
+            let enorm = normalize_path_cmp(&e.file);
+            let ename = Path::new(&enorm)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&enorm);
+            if (enorm == qnorm || ename == qname) && e.line >= line && e.line - line <= 8 {
+                if best.map_or(true, |(bl, _)| e.line < bl) {
+                    best = Some((e.line, e.addr));
+                }
+            }
+        }
+        best.map(|(_, a)| a)
+    }
+
+    pub fn symbol_for_addr(&self, addr: u32) -> Option<(&ElfSymbol, u32)> {
+        let clean = addr & !1;
+        let mut best: Option<&ElfSymbol> = None;
+        for s in &self.symbols {
+            if s.addr <= clean && s.addr >= 0x0800_0000 {
+                if best.map_or(true, |b| s.addr >= b.addr) {
+                    best = Some(s);
+                }
+            }
+        }
+        best.map(|s| (s, clean - s.addr))
+    }
+
+    pub fn executable_lines_for_file(&self, file_query: &str) -> Vec<u32> {
+        let qnorm = normalize_path_cmp(file_query);
+        let qname = Path::new(&qnorm)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&qnorm)
+            .to_string();
+        let mut out: Vec<u32> = self
+            .lines
+            .iter()
+            .filter(|e| {
+                let enorm = normalize_path_cmp(&e.file);
+                let ename = Path::new(&enorm)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&enorm);
+                enorm == qnorm || ename == qname
+            })
+            .map(|e| e.line)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+fn normalize_path_cmp(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn extract_dwarf_lines<'a>(obj: &object::File<'a>) -> Result<Vec<LineEntry>> {
+    let load_section = |id: gimli::SectionId| -> std::result::Result<Cow<'a, [u8]>, gimli::Error> {
+        match obj.section_by_name(id.name()) {
+            Some(sec) => Ok(sec.uncompressed_data().unwrap_or(Cow::Borrowed(&[]))),
+            None => Ok(Cow::Borrowed(&[])),
+        }
+    };
+
+    let dwarf_sections = gimli::DwarfSections::load(load_section)?;
+    let dwarf = dwarf_sections.borrow(|sec| EndianSlice::new(sec, LittleEndian));
+
+    let mut entries = Vec::new();
+    let mut iter = dwarf.units();
+    while let Some(header) = iter.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(program) = unit.line_program.clone() else { continue };
+        let comp_dir = unit
+            .comp_dir
+            .as_ref()
+            .map(|s| String::from_utf8_lossy(s.slice()).into_owned())
+            .unwrap_or_default();
+
+        let mut rows = program.rows();
+        while let Some((header, row)) = rows.next_row()? {
+            if row.end_sequence() {
+                continue;
+            }
+            let Some(line_nz) = row.line() else { continue };
+            let addr = (row.address() as u32) & !1;
+            let file_path = if let Some(file) = row.file(header) {
+                let mut p = PathBuf::new();
+                if let Some(dir_attr) = file.directory(header) {
+                    if let Ok(d_str) = dwarf.attr_string(&unit, dir_attr) {
+                        let ds = String::from_utf8_lossy(d_str.slice()).into_owned();
+                        let dp = PathBuf::from(&ds);
+                        if dp.is_relative() && !comp_dir.is_empty() {
+                            p.push(&comp_dir);
+                        }
+                        p.push(dp);
+                    }
+                } else if !comp_dir.is_empty() {
+                    p.push(&comp_dir);
+                }
+                if let Ok(f_str) = dwarf.attr_string(&unit, file.path_name()) {
+                    p.push(String::from_utf8_lossy(f_str.slice()).as_ref());
+                }
+                p.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            };
+
+            entries.push(LineEntry {
+                addr,
+                file: file_path,
+                line: line_nz.get() as u32,
+            });
+        }
+    }
+
+    entries.sort_by_key(|e| (e.addr, e.line));
+    entries.dedup_by(|a, b| a.addr == b.addr && a.file == b.file && a.line == b.line);
+    Ok(entries)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn extract_disassembly(
+    axf_path: &Path,
+    tc: &ToolchainInfo,
+    lines: &[LineEntry],
+    symbols: &[ElfSymbol],
+) -> Vec<DisasmLine> {
+    let mut out = Vec::new();
+    let Ok(fromelf) = tc.require_fromelf() else {
+        return out;
+    };
+    let Ok(output) = Command::new(fromelf).args(["-c", "-d"]).arg(axf_path).output() else {
+        return out;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    let mut pending_label: Option<String> = None;
+    let mut in_code_section = false;
+
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t.starts_with("** Section") {
+            in_code_section = t.contains("SHF_EXECINSTR") || t.contains("ER_RO");
+            pending_label = None;
+            continue;
+        }
+        if !in_code_section || t.is_empty() {
+            continue;
+        }
+        if t.starts_with("0x") {
+            if let Some(colon) = t.find(':') {
+                let addr_str = t[2..colon].trim();
+                if let Ok(addr) = u32::from_str_radix(addr_str, 16) {
+                    let rest = t[colon + 1..].trim();
+                    let opcode_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    let opcode = rest[..opcode_end].to_string();
+                    let after_op = rest[opcode_end..].trim_start();
+                    let ascii_chars = if opcode.len() >= 8 { 4 } else { 2 };
+                    let mnemonic = if after_op.len() > ascii_chars {
+                        after_op[ascii_chars..].trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    let sym_label = pending_label.take().or_else(|| {
+                        symbols
+                            .iter()
+                            .find(|s| s.addr == addr && !s.name.starts_with('$'))
+                            .map(|s| s.name.clone())
+                    });
+                    let le = line_lookup(lines, addr);
+                    out.push(DisasmLine {
+                        addr,
+                        opcode,
+                        mnemonic,
+                        label: sym_label,
+                        file: le.map(|l| l.file.clone()),
+                        line: le.map(|l| l.line),
+                    });
+                }
+            }
+            continue;
+        }
+        if !t.starts_with('$') && !t.starts_with("Size") && !t.starts_with("Address") && !t.contains(' ') {
+            pending_label = Some(t.to_string());
+        }
+    }
+    out
+}
+
+fn line_lookup(lines: &[LineEntry], addr: u32) -> Option<&LineEntry> {
+    let idx = lines.partition_point(|e| e.addr <= addr);
+    if idx == 0 {
+        None
+    } else {
+        let c = &lines[idx - 1];
+        if addr.saturating_sub(c.addr) <= 16 {
+            Some(c)
+        } else {
+            None
+        }
+    }
+}

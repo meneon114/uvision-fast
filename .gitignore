@@ -1,0 +1,16 @@
+# Rust build artifacts
+cli/target/
+**/target/
+
+# Node / Vite / VS Code Extension artifacts
+**/node_modules/
+extension/dist/
+extension/bin/
+extension/*.vsix
+web/dist/
+web/public/uvision_core.wasm
+
+# Editor / OS / logs
+*.log
+.DS_Store
+Thumbs.db

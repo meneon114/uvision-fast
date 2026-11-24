@@ -1,0 +1,31 @@
+{
+  "name": "uVision Fast — Keil µVision 5 ARM Simulator",
+  "short_name": "uVision Fast",
+  "description": "Fast offline ARM Cortex-M3 / STM32F1 Keil µVision 5 IDE, assembler, simulator, and WebSerial flasher powered by WebAssembly.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f0f0f0",
+  "theme_color": "#f0f0f0",
+  "orientation": "any",
+  "categories": ["developer tools", "education", "utilities"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

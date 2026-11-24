@@ -1,0 +1,29 @@
+[package]
+name = "uvcli"
+version = "0.2.0"
+edition = "2021"
+description = "Fast Keil uVision-compatible ARM Cortex-M3 / STM32F1 CLI, Cortex-M3 + peripheral simulator, WebAssembly engine, and OpenOCD GDB-RSP bridge"
+
+[lib]
+name = "uvision_core"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "uvcli"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+object = "0.36"
+gimli = "0.31"
+quick-xml = "0.37"
+anyhow = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
