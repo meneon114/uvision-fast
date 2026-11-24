@@ -1,10 +1,11 @@
 pub mod cpu;
 pub mod memory;
+pub mod nvic;
 pub mod peripherals;
 
 use crate::elf::{DisasmLine, LoadedElf};
 use crate::sim::cpu::{is_thumb32, Cpu, HaltReason};
-use crate::sim::memory::Memory;
+use crate::sim::memory::{DeviceMap, Memory};
 use crate::sim::peripherals::{LogicAnalyzer, LogicChannel, PeripheralSnapshot};
 use crate::target::{
     BreakpointInfo, CallFrame, DebugState, DebugTarget, MemoryReadResult, RegisterSnapshot,
@@ -28,10 +29,17 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    pub fn new(elf: LoadedElf, clock_hz: u32) -> Self {
+    /// Create a simulator for the default part (STM32F103C8, Blue Pill). `xtal_hz` is the
+    /// HSE crystal frequency; the core starts on the 8 MHz HSI like real silicon and runs
+    /// at whatever clock the program configures through RCC.
+    pub fn new(elf: LoadedElf, xtal_hz: u32) -> Self {
+        Self::new_for_device(elf, xtal_hz, "STM32F103C8")
+    }
+
+    /// Create a simulator whose flash/SRAM sizes follow the given ST part number.
+    pub fn new_for_device(elf: LoadedElf, xtal_hz: u32, device: &str) -> Self {
         let mut cpu = Cpu::default();
-        cpu.clock_hz = clock_hz.max(1);
-        let mut mem = Memory::default();
+        let mut mem = Memory::new(DeviceMap::for_device(device), xtal_hz.max(1));
         mem.reset_and_load(&elf);
         cpu.reset(&mut mem, Some(elf.entry));
 
@@ -128,7 +136,7 @@ impl Simulator {
             primask: self.cpu.primask,
             control: self.cpu.control,
             cycles: self.cpu.cycles,
-            time_sec: (self.cpu.cycles as f64) / (self.cpu.clock_hz as f64),
+            time_sec: self.cpu.time_sec,
             changed_regs: changed,
             n: self.cpu.flag_n(),
             z: self.cpu.flag_z(),
@@ -319,8 +327,19 @@ impl DebugTarget for Simulator {
                 _ => {}
             }
 
+            if self.cpu.sleeping && !self.mem.peripherals.interrupt_armed() {
+                reason = format!("Sleep 0x{:08X} (WFI/WFE with no interrupt source armed)", self.cpu.r[15]);
+                break;
+            }
+
             let after_pc = self.cpu.r[15];
-            if stop_on_self_loop && after_pc == cur_pc && prev_pc == cur_pc {
+            // A branch-to-self only ends the run when nothing (timer, SysTick, EXTI, UART)
+            // could raise an interrupt that leaves the loop.
+            if stop_on_self_loop
+                && after_pc == cur_pc
+                && prev_pc == cur_pc
+                && !self.mem.peripherals.interrupt_armed()
+            {
                 same_pc_streak += 1;
                 if same_pc_streak >= 2 {
                     reason = format!("SelfLoop 0x{:08X}", after_pc);
@@ -523,8 +542,11 @@ impl DebugTarget for Simulator {
 
     fn set_gpio_pin(&mut self, port: &str, pin: u8, high: bool) -> Result<()> {
         let p = port.trim().to_ascii_uppercase();
-        if let Some(g) = self.mem.peripherals.gpios.iter_mut().find(|g| g.name == p) {
-            g.set_ext_pin(pin, high);
+        if let Some(idx) = self.mem.peripherals.gpios.iter().position(|g| g.name == p) {
+            if pin > 15 {
+                return Err(anyhow!("Pin {} out of range (0-15)", pin));
+            }
+            self.mem.peripherals.set_input_pin(idx, pin, high);
             self.record_logic_points();
             Ok(())
         } else {
@@ -654,11 +676,12 @@ mod tests {
         mem.write32(0x4001_0810, 1 << 16);
         assert_eq!(mem.read32(0x4001_080C) & 1, 0);
 
-        // External pin input on PA1
-        mem.peripherals.gpios[0].set_ext_pin(1, true);
+        // External pin input on PA1 (floating input by reset configuration)
+        mem.peripherals.set_input_pin(0, 1, true);
         assert_eq!(mem.read32(0x4001_0808) & 2, 2);
 
-        // Timer 2 ticks
+        // Timer 2 ticks (clock enabled in RCC_APB1ENR)
+        mem.write32(0x4002_101C, 1);
         mem.write32(0x4000_0028, 0); // PSC = 0
         mem.write32(0x4000_002C, 5); // ARR = 5
         mem.write32(0x4000_0000, 1); // CEN = 1
