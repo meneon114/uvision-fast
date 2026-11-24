@@ -477,6 +477,21 @@ fn a_strong_handler_replaces_the_weak_startup_stub_by_name() {
 }
 
 #[test]
+fn step_out_of_an_interrupt_handler_stops_back_in_thread_mode() {
+    let mut sim = boot_to_main(LAB5_EXTI);
+    let idle = sim.elf.sym_by_name["idle"] & !1;
+    let isr = sim.elf.symbol_addr("EXTI0_IRQHandler").unwrap();
+    run_until(&mut sim, 10_000, |s| s.cpu.r[15] == idle).expect("setup finished");
+    sim.set_gpio_pin("GPIOA", 0, true).unwrap();
+    run_until(&mut sim, 100, |s| s.cpu.r[15] == isr).expect("EXTI0 handler entered");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.mem.peripherals.ipsr, 0, "back in Thread mode");
+    assert_eq!(sim.cpu.r[15], idle, "stopped at the interrupted instruction");
+    assert!(pin(&sim, PC, 15), "the handler ran to completion");
+}
+
+#[test]
 fn lab5_exp2_exti0_follows_button_edges() {
     let mut sim = boot_to_main(LAB5_EXTI);
     let idle = sim.elf.sym_by_name["idle"] & !1;

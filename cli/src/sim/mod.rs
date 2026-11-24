@@ -281,10 +281,19 @@ impl DebugTarget for Simulator {
         if self.cpu.r[14] == 0xFFFF_FFFF {
             return self.step_into();
         }
+        // In a handler, LR holds EXC_RETURN: step until this exception is no longer active
+        // (a nested handler that preempts it does not count as returning).
+        let handler = self.mem.peripherals.ipsr as usize;
+        let exc_return = handler != 0 && self.cpu.r[14] >= 0xFFFF_FFF0;
         let mut reason = "StepOut".to_string();
         for _ in 0..50_000 {
             let hr = self.step_one_internal();
-            if self.cpu.r[15] == ret_target {
+            let returned = if exc_return {
+                !self.mem.peripherals.nvic.active[handler]
+            } else {
+                self.cpu.r[15] == ret_target
+            };
+            if returned {
                 break;
             }
             if let Some(bp) = self.breakpoints.get(&self.cpu.r[15]) {
