@@ -1020,6 +1020,7 @@ impl Cpu {
 
     /// PushStack + ExceptionTaken (B1.5.6 / B1.5.7).
     fn exception_entry(&mut self, mem: &mut Memory, exc: usize, ret_addr: u32) {
+        let exec_before = self.execution_priority(&mem.peripherals.nvic);
         let forcealign = mem.peripherals.nvic.ccr & (1 << 9) != 0;
         let sp = self.r[13];
         let align = forcealign && sp & 4 != 0;
@@ -1040,22 +1041,38 @@ impl Cpu {
         } else {
             0xFFFF_FFF9
         };
-        self.take(mem, exc);
-        if stk_err {
-            let nvic = &mut mem.peripherals.nvic;
-            nvic.cfsr |= CFSR_STKERR;
-            if nvic.is_enabled_exc(EXC_BUSFAULT) {
-                nvic.pending[EXC_BUSFAULT] = true;
-                self.note_fault(mem, "BusFault STKERR (exception stacking failed: stack pointer outside SRAM)");
-            } else if exc == EXC_HARDFAULT || exc == EXC_NMI {
-                self.lockup("stacking failed while entering HardFault/NMI (stack pointer outside SRAM)".into());
-            } else {
-                // BusFault disabled: the derived fault escalates to HardFault (B1.5.15)
-                nvic.hfsr |= HFSR_FORCED;
-                nvic.pending[EXC_HARDFAULT] = true;
-                self.note_fault(mem, "HardFault (forced from BusFault STKERR: stack pointer outside SRAM)");
-            }
+        if !stk_err {
+            self.take(mem, exc);
+            return;
         }
+        // A stacking error is a derived exception (B1.5.15): a BusFault if it could preempt
+        // the code that was running, else a forced HardFault. Whichever of it and `exc` has
+        // the higher priority is taken on the frame already pushed; the other stays pending.
+        let nvic = &mut mem.peripherals.nvic;
+        nvic.cfsr |= CFSR_STKERR;
+        if exc == EXC_HARDFAULT || exc == EXC_NMI {
+            self.take(mem, exc);
+            self.lockup("stacking failed while entering HardFault/NMI (stack pointer outside SRAM)".into());
+            return;
+        }
+        let derived = if nvic.is_enabled_exc(EXC_BUSFAULT) && nvic.group_priority(EXC_BUSFAULT) < exec_before {
+            EXC_BUSFAULT
+        } else {
+            nvic.hfsr |= HFSR_FORCED;
+            EXC_HARDFAULT
+        };
+        let first = if (nvic.priority(derived), derived) < (nvic.priority(exc), exc) { derived } else { exc };
+        let other = if first == derived { exc } else { derived };
+        self.take(mem, first);
+        mem.peripherals.nvic.pending[other] = true;
+        self.note_fault(
+            mem,
+            if derived == EXC_BUSFAULT {
+                "BusFault STKERR (exception stacking failed: stack pointer outside SRAM)"
+            } else {
+                "HardFault (forced from BusFault STKERR: stack pointer outside SRAM)"
+            },
+        );
     }
 
     /// ExceptionTaken: enter the handler for `exc` (registers already stacked).

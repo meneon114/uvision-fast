@@ -501,3 +501,83 @@ EXTI0_IRQHandler PROC
     assert_eq!(sim.cpu.r[9], 1, "EXTI0 ran once FAULTMASK was cleared");
     assert_eq!(sim.cpu.r[8], 0);
 }
+
+/// Run until BKPT, stepping past fault reports (the debugger stops on each one).
+fn run_through_faults_to_bkpt(sim: &mut Simulator) {
+    for _ in 0..1_000_000 {
+        sim.cpu.halted_reason = HaltReason::Running;
+        sim.cpu.step(&mut sim.mem);
+        assert!(!sim.cpu.locked_up, "locked up: {:?}", sim.cpu.halted_reason);
+        if matches!(sim.cpu.halted_reason, HaltReason::Bkpt(_)) {
+            return;
+        }
+    }
+    panic!("BKPT not reached; pc=0x{:08X}", sim.cpu.r[15]);
+}
+
+/// SVC with the main stack 16 bytes into SRAM: half of the exception frame lands below it.
+fn stacking_fault_prog(setup: &str) -> String {
+    let body = format!("{setup}    LDR r0, =0x20000010\n    MOV sp, r0\n    SVC #0\n");
+    prog(&body, "    EXPORT SVC_Handler\n    EXPORT HardFault_Handler\n    EXPORT BusFault_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    MOVS r7, #0x11
+    BKPT #1
+    ENDP
+HardFault_Handler PROC
+    MOVS r7, #0x42
+    BKPT #2
+    ENDP
+BusFault_Handler PROC
+    MOVS r7, #0x33
+    BKPT #3
+    ENDP
+    END
+",
+    )
+}
+
+#[test]
+fn stacking_fault_is_taken_as_hardfault_instead_of_the_svc() {
+    let mut sim = boot(&stacking_fault_prog(""));
+    run_through_faults_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 0x42, "HardFault handler runs; no lockup from a second stacking attempt");
+    assert_ne!(sim.mem.read32(0xE000_ED28) & (1 << 12), 0, "BFSR.STKERR");
+    assert_ne!(sim.mem.read32(0xE000_ED2C) & (1 << 30), 0, "HFSR.FORCED (BusFault disabled)");
+    assert!(sim.mem.peripherals.nvic.pending[11], "the SVC stays pending");
+}
+
+#[test]
+fn stacking_fault_escalates_when_basepri_blocks_busfault() {
+    let setup = "    LDR r0, =0xE000ED24
+    LDR r1, [r0]
+    ORR r1, r1, #(1 << 17)      ; SHCSR.BUSFAULTENA
+    STR r1, [r0]
+    LDR r0, =0xE000ED18
+    MOVS r1, #0x4000            ; BusFault priority 0x40, SVC stays at 0
+    STR r1, [r0]
+    MOVS r0, #0x40
+    MSR BASEPRI, r0
+";
+    let mut sim = boot(&stacking_fault_prog(setup));
+    run_through_faults_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 0x42, "BusFault cannot preempt BASEPRI 0x40: forced HardFault");
+    assert_ne!(sim.mem.read32(0xE000_ED2C) & (1 << 30), 0, "HFSR.FORCED");
+}
+
+#[test]
+fn enabled_busfault_from_stacking_waits_behind_a_higher_priority_svc() {
+    let setup = "    LDR r0, =0xE000ED24
+    LDR r1, [r0]
+    ORR r1, r1, #(1 << 17)      ; SHCSR.BUSFAULTENA
+    STR r1, [r0]
+    LDR r0, =0xE000ED18
+    MOVS r1, #0x4000            ; BusFault priority 0x40, SVC stays at 0
+    STR r1, [r0]
+";
+    let mut sim = boot(&stacking_fault_prog(setup));
+    run_through_faults_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 0x11, "the SVC (priority 0) is taken first");
+    assert!(sim.mem.peripherals.nvic.pending[5], "BusFault STKERR pending");
+    assert_eq!(sim.mem.read32(0xE000_ED2C) & (1 << 30), 0, "no escalation");
+}
