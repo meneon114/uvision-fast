@@ -1139,13 +1139,15 @@ fn decode_load(h1: u32, h2: u32, sz: Size, in_it: bool, last_in_it: bool) -> (In
             Instr::Ldr { sz, signed, rt, addr, unpriv }
         }
     };
+    // LDRB/LDRH/LDRSB/LDRSH with Rt = SP are UNPREDICTABLE in every form (A7.7.46 etc.)
+    let sp_narrow = sz != Size::W && rt == 13;
     if rn == 15 {
         let addr = Addr::Lit { imm: h2 & 0xFFF, add: u23 };
-        return (mk(addr, false), pc_load_unpred);
+        return (mk(addr, false), pc_load_unpred || sp_narrow);
     }
     if u23 {
         let addr = Addr::Imm { rn, imm: h2 & 0xFFF, add: true, index: true, wback: false };
-        return (mk(addr, false), pc_load_unpred);
+        return (mk(addr, false), pc_load_unpred || sp_narrow);
     }
     if bit(h2, 11) {
         let p = bit(h2, 10);

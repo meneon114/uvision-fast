@@ -643,7 +643,7 @@ fn describe(op: &Op) -> String {
     }
 }
 
-fn reg_of(op: &Op) -> EResult<u8> {
+pub(crate) fn reg_of(op: &Op) -> EResult<u8> {
     match op {
         Op::Reg(r) => Ok(*r),
         _ => Err(format!("Expected a register, found {}", describe(op))),
@@ -668,8 +668,9 @@ fn nops(insn: &Insn, n: &[usize]) -> EResult<()> {
 // ---------------------------------------------------------------------------------------
 
 /// Does `LDR Rt, =expr` with this value need a literal pool slot (vs. MOV/MVN/MOVW)?
-pub fn literal_needs_pool(v: &Val) -> bool {
-    if !v.is_const() {
+/// SP and PC always load from the pool: MOV/MVN/MOVW cannot write them.
+pub fn literal_needs_pool(v: &Val, rt: Option<u8>) -> bool {
+    if !v.is_const() || matches!(rt, Some(13 | 15)) {
         return true;
     }
     let u = v.v as u32;
@@ -706,6 +707,16 @@ fn verify(insn: &Insn, ctx: Ctx, bytes: &[u8]) -> EResult<()> {
             "'{}': UNPREDICTABLE register usage on Cortex-M3 (e.g. SP/PC not allowed here, or a PC write that is not last in its IT block)",
             insn.text
         ));
+    }
+    // Rd = PC with S set is the CMP/CMN/TST/TEQ encoding: never let `SUBS pc, lr, #4`
+    // (an ARM-state idiom) silently become a compare.
+    if let Instr::AluImm { op, .. } | Instr::AluReg { op, .. } = d.instr {
+        if op.is_compare() && !matches!(insn.base, "CMP" | "CMN" | "TST" | "TEQ") {
+            return Err(format!(
+                "'{}': PC cannot be the destination of a flag-setting data-processing instruction on Cortex-M3 (return from a handler with BX LR or POP {{PC}})",
+                insn.text
+            ));
+        }
     }
     let s_of = match d.instr {
         Instr::AluImm { op, s, .. } | Instr::AluReg { op, s, .. } if !op.is_compare() => Some(s),
@@ -1271,7 +1282,7 @@ fn enc_addsub(e: &E) -> EResult<Vec<u8>> {
         Op::Reg(m) => {
             let m = *m;
             let (ty, imm5) = opt_shift(e, rest.get(1))?;
-            let shifted = rest.len() == 2 && !(ty == 0 && imm5 == 0);
+            let shifted = rest.len() == 2;
             if !shifted && e.may_narrow() {
                 if lo(d) && lo(n) && lo(m) && e.narrow_s_ok() && !(two_op && !sub && !s && !e.ctx.in_it) {
                     return Ok(n16(if sub { 0x1A00 } else { 0x1800 } | ((m as u32) << 6) | ((n as u32) << 3) | d as u32));
@@ -1402,7 +1413,7 @@ fn enc_logic(e: &E) -> EResult<Vec<u8>> {
         Op::Reg(m) => {
             let m = *m;
             let (ty, imm5) = opt_shift(e, rest.get(1))?;
-            let plain = ty == 0 && imm5 == 0;
+            let plain = rest.len() == 1;
             if let Some(a) = alu16 {
                 if plain && e.may_narrow() && lo(d) && lo(n) && lo(m) && e.narrow_s_ok() {
                     if d == n {
@@ -1462,7 +1473,8 @@ fn enc_compare(e: &E) -> EResult<Vec<u8>> {
         Op::Reg(m) => {
             let m = *m;
             let (ty, imm5) = opt_shift(e, insn.ops.get(2))?;
-            let plain = ty == 0 && imm5 == 0;
+            // an explicitly written shift (even LSL #0) selects the 32-bit form, as in llvm-mc
+            let plain = insn.ops.get(2).is_none();
             if plain && e.may_narrow() {
                 if let Some(b) = n16_reg {
                     if lo(n) && lo(m) {
@@ -1544,7 +1556,9 @@ fn enc_shift(e: &E) -> EResult<Vec<u8>> {
             }
             let n = n as u32;
             let (ty, imm5) = shift_bits(t, n)?;
-            if t != SRType::Ror && lo(d) && lo(m) && e.narrow_s_ok() && e.may_narrow() {
+            // LSL #0 narrow is MOVS Rd, Rm (T2), which is not allowed inside an IT block
+            let movs_t2 = ty == 0 && imm5 == 0;
+            if t != SRType::Ror && lo(d) && lo(m) && e.narrow_s_ok() && e.may_narrow() && !(movs_t2 && e.ctx.in_it) {
                 return Ok(n16((ty << 11) | (imm5 << 6) | ((m as u32) << 3) | d as u32));
             }
             Ok(dp_reg(2, s, 15, d, m, ty, imm5))
@@ -1721,11 +1735,8 @@ fn enc_ldst(e: &E) -> EResult<Vec<u8>> {
                 return Err("'=expr' is only allowed with LDR".into());
             }
             let v = e.val(x)?;
-            if !literal_needs_pool(&v) {
+            if !literal_needs_pool(&v, Some(t)) {
                 let u = v.v as u32;
-                if bad(t) {
-                    return Err("LDR SP/PC, =constant is not supported".into());
-                }
                 if let Some(i) = modimm(u) {
                     return Ok(dp_imm(2, false, 15, t, i));
                 }

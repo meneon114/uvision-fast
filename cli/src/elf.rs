@@ -60,6 +60,13 @@ pub struct LoadedElf {
     pub mapping: Vec<(u32, bool)>,
 }
 
+impl LoadedElf {
+    /// Address of a symbol with the Thumb bit removed from code symbols only.
+    pub fn symbol_addr(&self, name: &str) -> Option<u32> {
+        self.symbols.iter().find(|s| s.name == name).map(|s| s.addr)
+    }
+}
+
 /// (p_vaddr, p_paddr) of each PT_LOAD program header of a little-endian ELF32 file.
 fn program_header_paddrs(b: &[u8]) -> Vec<(u32, u32)> {
     let rd16 = |o: usize| b.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
@@ -141,8 +148,18 @@ impl LoadedElf {
                 continue;
             }
             let raw_addr = sym.address() as u32;
-            let addr = raw_addr & !1;
-            let is_func = sym.kind() == SymbolKind::Text || (raw_addr & 1) == 1;
+            // Bit 0 is the Thumb bit only on code symbols; a data label (STT_OBJECT) can sit
+            // at an odd address, e.g. a DCB right after another DCB.
+            let in_code = sym
+                .section_index()
+                .and_then(|i| obj.section_by_index(i).ok())
+                .is_some_and(|s| s.kind() == object::SectionKind::Text);
+            let is_func = match sym.kind() {
+                SymbolKind::Text => true,
+                SymbolKind::Data => false,
+                _ => in_code && raw_addr & 1 == 1,
+            };
+            let addr = if is_func { raw_addr & !1 } else { raw_addr };
             let size = sym.size() as u32;
             sym_by_name.entry(name.to_string()).or_insert(raw_addr);
             symbols.push(ElfSymbol {

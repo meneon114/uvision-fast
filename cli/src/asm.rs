@@ -523,8 +523,13 @@ impl Asm {
                 }
             }
         }
+        // A label just before ALIGN in code names the instruction after the padding, so it
+        // binds to that instruction (and keeps its Thumb bit) rather than to the ALIGN.
+        let defer = matches!(body, Body::Align { .. }) && self.areas[a].kind == AreaKind::Code;
         let idx = self.raw_stmt(st.file, line, a, body, size);
-        self.bind_pending(st, idx);
+        if !defer {
+            self.bind_pending(st, idx);
+        }
         Ok(idx)
     }
 
@@ -665,7 +670,14 @@ impl Asm {
         }
         if opu == "RN" {
             let name = label.ok_or("RN needs a name in column 1")?;
-            let r = encode::parse_reg(args).ok_or_else(|| format!("RN: '{}' is not a register", args))?;
+            // armasm: `name RN expr`, where expr is a register or a constant 0-15
+            let r = match encode::parse_reg(args).or_else(|| self.files[st.file].regs.get(args.trim()).copied()) {
+                Some(r) => r,
+                None => match self.eval(st.file, args, None) {
+                    Ok(v) if v.is_const() && (0..=15).contains(&v.v) => v.v as u8,
+                    _ => return Err(format!("RN: '{}' is not a register or a register number 0-15", args.trim())),
+                },
+            };
             self.files[st.file].regs.insert(name, r);
             return Ok(());
         }
@@ -1003,7 +1015,9 @@ impl Asm {
             in_it = true;
             last_in_it = st.it.is_empty();
             let c_eff = if c == 14 { 14 } else { c };
-            if insn.cond != c_eff {
+            // BKPT runs unconditionally, so it may be written without the block's condition
+            let bkpt_ok = insn.base == "BKPT" && insn.cond == 14;
+            if insn.cond != c_eff && !bkpt_ok {
                 st.it.clear();
                 if insn.cond == 14 {
                     return Err(format!(
@@ -1319,7 +1333,11 @@ impl Asm {
             let p = *p;
             let Some(e) = self.lit_expr(s) else { continue };
             if let Ok(v) = self.eval(self.stmts[s].file, e, Some(self.stmts[s].addr)) {
-                if encode::literal_needs_pool(&v) {
+                let rt = match &self.stmts[s].body {
+                    Body::Insn { insn, .. } => insn.ops.first().and_then(|o| encode::reg_of(o).ok()),
+                    _ => None,
+                };
+                if encode::literal_needs_pool(&v, rt) {
                     let dv = v.data_value();
                     if !slots[p].contains(&dv) {
                         slots[p].push(dv);
@@ -1651,6 +1669,17 @@ pub fn assemble_sources(
         }
     }
     let mut errs: Vec<(usize, u32, String)> = Vec::new();
+    // SPACE sizes are only measured during layout; report the ones that never evaluated
+    for st in &asm.stmts {
+        if let Body::Space { size, .. } = &st.body {
+            match asm.eval(st.file, size, Some(st.addr)) {
+                Ok(v) if v.is_const() && (0..=0x0100_0000).contains(&v.v) => {}
+                Ok(v) if v.is_const() => errs.push((st.file, st.line, format!("SPACE size {} is out of range (0 to 16 MiB)", v.v))),
+                Ok(_) => errs.push((st.file, st.line, format!("SPACE size '{}' must be a constant, not an address", size.trim()))),
+                Err(e) => errs.push((st.file, st.line, format!("SPACE size '{}': {}", size.trim(), e))),
+            }
+        }
+    }
     let regions: Vec<(Vec<usize>, bool)> = vec![(lay.rom_order.clone(), true), (lay.rw_order.clone(), false)];
     for (order, is_rom) in regions {
         for a in order {

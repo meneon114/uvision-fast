@@ -218,8 +218,7 @@ pub fn resolve_bp_spec(elf: &LoadedElf, spec: &str) -> Result<(u32, Option<Strin
             return Err(anyhow::anyhow!("No instruction mapped to {}:{}", f, line));
         }
     }
-    if let Some(&addr) = elf.sym_by_name.get(spec) {
-        let clean = addr & !1;
+    if let Some(clean) = elf.symbol_addr(spec) {
         let le = elf.line_for_addr(clean);
         return Ok((clean, le.map(|l| l.file.clone()), le.map(|l| l.line)));
     }

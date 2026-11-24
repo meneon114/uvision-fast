@@ -198,3 +198,76 @@ fn vector_table_and_data_keep_their_size() {
     assert_eq!(elf.entry, reset);
     assert!(rom.data.len() >= 76 * 4 + 32);
 }
+
+fn body(b: &str) -> String {
+    format!("    AREA main, CODE, READONLY\n    EXPORT _main\n    ENTRY\n_main PROC\n{}\n    ENDP\n    END\n", b)
+}
+
+fn first_error(b: &InMemoryBuild) -> String {
+    b.result.diagnostics.iter().find(|d| d.severity == "error").map(|d| d.message.clone()).unwrap_or_default()
+}
+
+#[test]
+fn flag_setting_write_to_pc_is_rejected_not_turned_into_a_compare() {
+    for src in ["SUBS pc, lr, #4", "ADDS pc, r0, #4", "ANDS pc, r0, #1", "EORS pc, r0, r1"] {
+        let b = build(&body(&format!("    {}", src)));
+        assert!(!b.result.success, "`{}` must not assemble (it would be CMP/CMN/TST/TEQ)", src);
+        assert!(first_error(&b).contains("PC cannot be the destination"), "{}: {}", src, first_error(&b));
+    }
+    assert!(build(&body("    CMP r0, #-1\n    TST r1, #4")).result.success);
+}
+
+#[test]
+fn label_before_align_keeps_its_thumb_bit() {
+    let b = build(&body("    ALIGN 4\n    MOVS r0, #42\n    BKPT #0"));
+    assert!(b.result.success, "{}", b.result.log);
+    let elf = crate::elf::LoadedElf::load_from_bytes("t.axf", b.elf_bytes.as_ref().unwrap()).unwrap();
+    assert_eq!(elf.sym_by_name["_main"] & 1, 1, "_main is code: its address carries the Thumb bit");
+}
+
+#[test]
+fn bad_space_size_is_an_error() {
+    for size in ["UNDEFINED_SIZE", "-16"] {
+        let src = format!("    AREA d, DATA, READWRITE\nbuf SPACE {}\n{}", size, body("    LDR r0, =buf"));
+        let b = build(&src);
+        assert!(!b.result.success, "SPACE {} must not build", size);
+        assert!(first_error(&b).contains("SPACE"), "{}", first_error(&b));
+    }
+}
+
+#[test]
+fn ldr_sp_literal_always_uses_the_pool() {
+    let b = build(&body("    LDR sp, =0x20000000\n    LDR r0, =0x20000000"));
+    assert!(b.result.success, "{}", b.result.log);
+    let elf = crate::elf::LoadedElf::load_from_bytes("t.axf", b.elf_bytes.as_ref().unwrap()).unwrap();
+    let main = elf.symbol_addr("_main").unwrap();
+    let code = rom_bytes(&elf, main, 8);
+    assert_eq!(hw_str(&code[..4]), "f8df d004", "LDR.W sp, [pc, #4] from the literal pool");
+    assert_eq!(hw_str(&code[4..]), "f04f 5000", "r0 still gets MOV.W");
+}
+
+#[test]
+fn rn_accepts_a_register_number() {
+    let b = build(&format!("counter RN 4\n{}", body("    MOVS counter, #1")));
+    assert!(b.result.success, "{}", b.result.log);
+}
+
+#[test]
+fn byte_and_halfword_loads_into_sp_are_rejected() {
+    for src in ["LDRB sp, [r0, #0]", "LDRH sp, [r0, #0]", "LDRSB sp, [r0, #4]"] {
+        assert!(!build(&body(&format!("    {}", src))).result.success, "`{}` is UNPREDICTABLE", src);
+    }
+}
+
+#[test]
+fn odd_data_labels_keep_their_address() {
+    let src = format!(
+        "    AREA d, DATA, READWRITE\nlength DCB 0x11\ninput_string DCB 0x22, 0x33\n{}",
+        body("    LDR r0, =input_string")
+    );
+    let b = build(&src);
+    assert!(b.result.success, "{}", b.result.log);
+    let elf = crate::elf::LoadedElf::load_from_bytes("t.axf", b.elf_bytes.as_ref().unwrap()).unwrap();
+    let a = elf.symbol_addr("input_string").unwrap();
+    assert_eq!(a, elf.symbol_addr("length").unwrap() + 1, "a data label at an odd address is not a Thumb address");
+}
