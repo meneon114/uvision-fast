@@ -332,18 +332,18 @@ impl DebugTarget for Simulator {
                 _ => {}
             }
 
-            if self.cpu.sleeping && !self.mem.peripherals.interrupt_armed() {
+            if self.cpu.sleeping && !self.mem.peripherals.activity_pending() {
                 reason = format!("Sleep 0x{:08X} (WFI/WFE with no interrupt source armed)", self.cpu.r[15]);
                 break;
             }
 
             let after_pc = self.cpu.r[15];
-            // A branch-to-self only ends the run when nothing (timer, SysTick, EXTI, UART)
-            // could raise an interrupt that leaves the loop.
+            // A branch-to-self only ends the run when nothing (SysTick, EXTI, a counting
+            // timer driving an output-compare pin, UART) can still change what happens.
             if stop_on_self_loop
                 && after_pc == cur_pc
                 && prev_pc == cur_pc
-                && !self.mem.peripherals.interrupt_armed()
+                && !self.mem.peripherals.activity_pending()
             {
                 same_pc_streak += 1;
                 if same_pc_streak >= 2 {
@@ -440,8 +440,22 @@ impl DebugTarget for Simulator {
     }
 
     fn write_memory(&mut self, addr: u32, data: &[u8]) -> Result<()> {
-        for (i, &b) in data.iter().enumerate() {
-            self.mem.write8(addr.wrapping_add(i as u32), b);
+        // Use the widest aligned access, as a debugger does: peripheral registers replicate
+        // narrow writes across the word, so byte-by-byte writes would clobber them.
+        let mut i = 0usize;
+        while i < data.len() {
+            let a = addr.wrapping_add(i as u32);
+            let left = data.len() - i;
+            if a.is_multiple_of(4) && left >= 4 {
+                self.mem.write32(a, u32::from_le_bytes(data[i..i + 4].try_into().unwrap()));
+                i += 4;
+            } else if a.is_multiple_of(2) && left >= 2 {
+                self.mem.write16(a, u16::from_le_bytes([data[i], data[i + 1]]));
+                i += 2;
+            } else {
+                self.mem.write8(a, data[i]);
+                i += 1;
+            }
         }
         Ok(())
     }
@@ -524,8 +538,7 @@ impl DebugTarget for Simulator {
                 kind: "memory32".to_string(),
             });
         }
-        if let Some(&addr) = self.elf.sym_by_name.get(trimmed) {
-            let clean = addr & !1;
+        if let Some(clean) = self.elf.symbol_addr(trimmed) {
             let v = self.mem.read32(clean);
             return Ok(WatchEval {
                 expr: trimmed.to_string(),
@@ -591,13 +604,12 @@ impl DebugTarget for Simulator {
 /// `"PA0"`, `"pc15"`, `"GPIOB.3"` -> (port index, pin).
 pub fn parse_pin_name(s: &str) -> Option<(u8, u8)> {
     let u = s.trim().to_ascii_uppercase();
-    let (port, pin) = if let Some(rest) = u.strip_prefix("GPIO") {
-        let (p, n) = rest.split_once('.').unwrap_or((&rest[..1.min(rest.len())], rest.get(1..).unwrap_or("")));
-        (p.chars().next()?, n.to_string())
-    } else {
-        let rest = u.strip_prefix('P')?;
-        (rest.chars().next()?, rest[1..].to_string())
-    };
+    let rest = u.strip_prefix("GPIO").or_else(|| u.strip_prefix('P'))?;
+    // split by characters, not bytes, so non-ASCII input is rejected instead of panicking
+    let mut chars = rest.chars();
+    let port = chars.next()?;
+    let tail = chars.as_str();
+    let pin = tail.strip_prefix('.').unwrap_or(tail);
     if !('A'..='G').contains(&port) {
         return None;
     }

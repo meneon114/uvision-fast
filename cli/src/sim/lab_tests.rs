@@ -650,3 +650,96 @@ fn lab6_exp2_tim2_output_compare_toggles_pa0() {
     assert_eq!((t.psc, t.arr, t.ccr[0]), (3599, 9999, 4999));
 }
 
+
+#[test]
+fn lab6_exp2_default_run_keeps_going_while_tim2_toggles_pa0() {
+    // A debugger "Run" must not stop at the idle `B forever` loop while TIM2 is counting:
+    // output compare toggles PA0 in hardware with no interrupt involved.
+    let mut sim = boot_to_main(LAB6_OC);
+    let st = sim.run(200_000, true).unwrap();
+    assert!(!st.halt_reason.starts_with("SelfLoop"), "run stopped early: {}", st.halt_reason);
+    assert!(pin(&sim, PA, 0), "PA0 toggled high by the first compare match");
+}
+
+// ---------------------------------------------------------------------------------------
+// Peripheral details the labs can trip over
+// ---------------------------------------------------------------------------------------
+
+const TIM2_PROBE: &str = "
+    AREA main, CODE, READONLY
+    EXPORT _main
+    ENTRY
+_main PROC
+    LDR r2, =0x4002101C         ; RCC_APB1ENR
+    MOVS r1, #1
+    STR r1, [r2]                ; TIM2 clock on
+    LDR r2, =0x40000000
+    LDR r0, [r2, #0x2C]         ; ARR after reset
+    STR r1, [r2, #0x00]         ; CEN without programming ARR
+    NOP
+    NOP
+    NOP
+    LDR r3, [r2, #0x24]         ; CNT: blocked while ARR = 0
+    MOVS r1, #0
+    STR r1, [r2, #0x00]
+    MOVS r1, #2
+    STR r1, [r2, #0x00]         ; UDIS
+    MOVS r1, #9
+    STR r1, [r2, #0x28]         ; PSC = 9 (preload)
+    MOVS r1, #1
+    STR r1, [r2, #0x14]         ; UG while UDIS: no update event
+    LDR r4, [r2, #0x10]         ; SR: UIF stays clear
+    BKPT #0
+    ENDP
+    END
+";
+
+#[test]
+fn tim2_arr_resets_to_zero_and_ug_respects_udis() {
+    let mut sim = boot_to_main(TIM2_PROBE);
+    run_until(&mut sim, 10_000, |s| matches!(s.cpu.halted_reason, HaltReason::Bkpt(_)));
+    let r = sim.cpu.r;
+    assert_eq!(r[0], 0, "TIMx_ARR reset value is 0x0000 (RM0008 15.4.12)");
+    assert_eq!(r[3], 0, "the counter is blocked while ARR is 0");
+    assert_eq!(r[4] & 1, 0, "UG with UDIS set does not set UIF");
+    assert_eq!(sim.mem.peripherals.timers[1].psc_active, 0, "UG with UDIS does not load the prescaler");
+}
+
+#[test]
+fn debugger_memory_write_to_a_peripheral_register_is_one_word() {
+    let mut sim = boot_to_main(LAB6_OC);
+    run_for(&mut sim, 2000); // TIM2 clock enabled by the program
+    sim.write_memory(0x4000_002C, &[49, 0, 0, 0]).unwrap();
+    assert_eq!(sim.mem.peripherals.timers[1].arr, 49, "TIM2_ARR written as one word");
+}
+
+const OD_LINK: &str = "
+    AREA main, CODE, READONLY
+    EXPORT _main
+    ENTRY
+_main PROC
+    LDR r2, =0x40021018         ; RCC_APB2ENR: GPIOA
+    MOVS r1, #4
+    STR r1, [r2]
+    LDR r2, =0x40010800
+    LDR r1, =0x44480006         ; PA0 open-drain output 2 MHz, PA4 input pull-up/down
+    STR r1, [r2, #0x00]
+    MOVS r1, #1
+    STR r1, [r2, #0x0C]         ; ODR0 = 1 (release PA0), ODR4 = 0 (PA4 pull-down)
+    BKPT #0
+    ENDP
+    END
+";
+
+#[test]
+fn linked_pins_share_one_level() {
+    let mut sim = boot_to_main(OD_LINK);
+    run_until(&mut sim, 10_000, |s| matches!(s.cpu.halted_reason, HaltReason::Bkpt(_)));
+    assert!(pin(&sim, PA, 0), "a released open-drain pin floats high on its own");
+    sim.connect_pins("PA0", "PA4", true).unwrap();
+    let idr = sim.mem.peripherals.gpios[PA].idr;
+    assert_eq!(idr & 0x11, 0, "the pull-down on PA4 pulls the whole wire low: both IDR bits read 0");
+    sim.connect_pins("PA0", "PA4", false).unwrap();
+    assert_eq!(sim.mem.peripherals.gpios[PA].idr & 0x11, 0x01);
+    assert!(sim.connect_pins("P\u{c9}0", "PA4", true).is_err(), "non-ASCII pin names are rejected, not a panic");
+}

@@ -209,7 +209,8 @@ impl ServerState {
                         .map(|x| x as u32)
                         .or_else(|| self.project.as_ref().map(|p| p.options.xtal_hz))
                         .unwrap_or(8_000_000);
-                    Box::new(Simulator::new(elf.clone(), clk))
+                    let device = self.project.as_ref().map(|p| p.options.device.clone()).unwrap_or_else(|| "STM32F103C8".into());
+                    Box::new(Simulator::new_for_device(elf.clone(), clk, &device))
                 };
 
                 // Apply initial breakpoints if passed

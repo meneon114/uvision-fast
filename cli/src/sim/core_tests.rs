@@ -396,3 +396,108 @@ fn undefined_wide_store_encoding_faults() {
     assert_ne!(hfsr & (1 << 30), 0, "HFSR.FORCED (UsageFault disabled)");
     assert_ne!(sim.mem.read32(0x2000_0000), 0x77, "nothing was stored");
 }
+
+#[test]
+fn bkpt_in_it_block_is_unconditional_and_unprivileged_mrs_reads_zero() {
+    let src = prog(
+        "
+    MOVS r0, #1
+    MSR PRIMASK, r0
+    MOVS r0, #0x80
+    MSR BASEPRI, r0
+    MOVS r0, #1
+    MSR CONTROL, r0             ; unprivileged Thread mode
+    ISB
+    MRS r4, PRIMASK
+    MRS r5, BASEPRI
+    CMP r0, #0                  ; Z clear
+    IT EQ
+    BKPT #7                     ; still stops: BKPT ignores the IT condition
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    for _ in 0..1_000_000 {
+        sim.cpu.halted_reason = HaltReason::Running;
+        sim.cpu.step(&mut sim.mem);
+        if !matches!(sim.cpu.halted_reason, HaltReason::Running) {
+            break;
+        }
+    }
+    assert!(matches!(sim.cpu.halted_reason, HaltReason::Bkpt(7)), "{:?}", sim.cpu.halted_reason);
+    assert_eq!((sim.cpu.r[4], sim.cpu.r[5]), (0, 0), "mask registers read as zero when unprivileged");
+}
+
+#[test]
+fn failed_unstacking_escalates_to_hardfault_without_resuming() {
+    let src = prog("    SVC #0\n    MOVS r7, #0x77              ; must never run\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    LDR r0, =0x30000000         ; nothing is mapped here
+    MSR PSP, r0
+    LDR r0, =0xFFFFFFFD         ; return to Thread mode on the PSP
+    BX r0
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    let hf = sim.elf.symbols.iter().find(|s| s.name == "HardFault_Handler").unwrap().addr;
+    let mut taken = false;
+    for _ in 0..1_000_000 {
+        sim.cpu.halted_reason = HaltReason::Running;
+        sim.cpu.step(&mut sim.mem);
+        if sim.cpu.r[15] == hf {
+            taken = true;
+            break;
+        }
+    }
+    assert!(taken, "HardFault taken during the return, pc=0x{:08X}", sim.cpu.r[15]);
+    assert_ne!(sim.mem.read32(0xE000_ED28) & (1 << 11), 0, "BFSR.UNSTKERR");
+    assert_ne!(sim.mem.read32(0xE000_ED2C) & (1 << 30), 0, "HFSR.FORCED (BusFault disabled)");
+    assert_ne!(sim.cpu.r[7], 0x77);
+    assert_eq!(sim.cpu.r[14], 0xFFFF_FFFD, "derived exception keeps the original EXC_RETURN");
+}
+
+#[test]
+fn nmi_return_with_faultmask_does_not_tail_chain() {
+    let src = prog(
+        "
+    LDR r0, =0xE000E100
+    MOVS r1, #0x40              ; enable EXTI0 (IRQ 6)
+    STR r1, [r0]
+    LDR r0, =0xE000E200
+    STR r1, [r0]                ; pend EXTI0
+    CPSID f                     ; FAULTMASK = 1: EXTI0 stays pending
+    LDR r0, =0xE000ED04
+    MOVS r1, #1
+    LSLS r1, r1, #31
+    STR r1, [r0]                ; NMIPENDSET
+    MRS r6, IPSR                ; back in Thread mode, EXTI0 not taken
+    CPSIE f
+    NOP
+",
+        "    EXPORT NMI_Handler\n    EXPORT EXTI0_IRQHandler\n",
+    )
+    .replace(
+        "    END\n",
+        "NMI_Handler PROC
+    BX lr
+    ENDP
+EXTI0_IRQHandler PROC
+    MRS r8, FAULTMASK
+    ADDS r9, r9, #1
+    LDR r0, =0xE000E280
+    MOVS r1, #0x40
+    STR r1, [r0]                ; clear pending
+    BX lr
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[6], 0, "NMI return did not tail-chain into EXTI0 while FAULTMASK was set");
+    assert_eq!(sim.cpu.r[9], 1, "EXTI0 ran once FAULTMASK was cleared");
+    assert_eq!(sim.cpu.r[8], 0);
+}

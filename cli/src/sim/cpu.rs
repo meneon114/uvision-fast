@@ -416,7 +416,8 @@ impl Cpu {
         self.r[15] = pc.wrapping_add(d.len as u32);
         if in_it {
             self.set_itstate(thumb::it_advance(it));
-            if !self.cond_passed(it >> 4) {
+            // BKPT executes unconditionally, even inside an IT block (A7.7.17)
+            if !self.cond_passed(it >> 4) && !matches!(d.instr, Instr::Bkpt(_)) {
                 return Ok(1);
             }
         }
@@ -960,6 +961,8 @@ impl Cpu {
                     self.psp
                 }
             }
+            // the mask registers read as zero from unprivileged code
+            16..=19 if !priv_ => 0,
             16 => self.primask & 1,
             17 | 18 => self.basepri & 0xFF,
             19 => self.faultmask & 1,
@@ -1041,8 +1044,17 @@ impl Cpu {
         if stk_err {
             let nvic = &mut mem.peripherals.nvic;
             nvic.cfsr |= CFSR_STKERR;
-            nvic.pending[EXC_BUSFAULT] = true;
-            self.note_fault(mem, "BusFault STKERR (exception stacking failed: stack pointer outside SRAM)");
+            if nvic.is_enabled_exc(EXC_BUSFAULT) {
+                nvic.pending[EXC_BUSFAULT] = true;
+                self.note_fault(mem, "BusFault STKERR (exception stacking failed: stack pointer outside SRAM)");
+            } else if exc == EXC_HARDFAULT || exc == EXC_NMI {
+                self.lockup("stacking failed while entering HardFault/NMI (stack pointer outside SRAM)".into());
+            } else {
+                // BusFault disabled: the derived fault escalates to HardFault (B1.5.15)
+                nvic.hfsr |= HFSR_FORCED;
+                nvic.pending[EXC_HARDFAULT] = true;
+                self.note_fault(mem, "HardFault (forced from BusFault STKERR: stack pointer outside SRAM)");
+            }
         }
     }
 
@@ -1165,17 +1177,8 @@ impl Cpu {
         self.excl = None;
 
         // Tail-chain into a pending exception that can preempt the context we return to
-        let target_prio = {
-            let nvic = &mem.peripherals.nvic;
-            let mut p = nvic.active_priority();
-            if self.basepri & 0xFF != 0 {
-                p = p.min(self.basepri_group(nvic));
-            }
-            if self.primask & 1 != 0 {
-                p = p.min(0);
-            }
-            p
-        };
+        // (FAULTMASK stays set on a return from NMI, so it counts here too)
+        let target_prio = self.execution_priority(&mem.peripherals.nvic);
         if let Some((exc, prio)) = mem.peripherals.nvic.highest_pending() {
             if prio < target_prio {
                 self.r[14] = exc_return;
@@ -1189,14 +1192,32 @@ impl Cpu {
         self.bank_sp();
         let frame = if kind == 0xD { self.psp } else { self.msp };
         let mut w = [0u32; 8];
+        let mut unstk_err = false;
         for (i, slot) in w.iter_mut().enumerate() {
             match mem.read(frame + 4 * i as u32, 4, true) {
                 Ok(v) => *slot = v,
-                Err(_) => {
-                    mem.peripherals.nvic.cfsr |= CFSR_UNSTKERR;
-                    mem.peripherals.nvic.pending[EXC_BUSFAULT] = true;
-                }
+                Err(_) => unstk_err = true,
             }
+        }
+        if unstk_err {
+            // The return is abandoned and the derived BusFault (or HardFault, when BusFault is
+            // disabled or cannot preempt) is taken straight away, like a tail-chain.
+            mem.peripherals.nvic.cfsr |= CFSR_UNSTKERR;
+            let nvic = &mem.peripherals.nvic;
+            let exec = self.execution_priority(nvic);
+            let target = if nvic.is_enabled_exc(EXC_BUSFAULT) && nvic.group_priority(EXC_BUSFAULT) < exec {
+                EXC_BUSFAULT
+            } else if exec <= -1 {
+                self.lockup("exception return unstacking failed at priority -1 or higher".into());
+                return Ok(());
+            } else {
+                mem.peripherals.nvic.hfsr |= HFSR_FORCED;
+                EXC_HARDFAULT
+            };
+            self.r[14] = exc_return;
+            self.take(mem, target);
+            self.note_fault(mem, "BusFault UNSTKERR (exception return could not read the stack frame)");
+            return Ok(());
         }
         let psr = w[7];
         let forcealign = mem.peripherals.nvic.ccr & (1 << 9) != 0;
@@ -1241,7 +1262,7 @@ impl Cpu {
     /// True when the core can make no further progress without an external event
     /// (sleeping with nothing armed, or locked up).
     pub fn is_stuck(&self, mem: &Memory) -> bool {
-        self.locked_up || (self.sleeping && !mem.peripherals.interrupt_armed())
+        self.locked_up || (self.sleeping && !mem.peripherals.activity_pending())
     }
 }
 

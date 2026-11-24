@@ -497,13 +497,13 @@ impl TimerState {
             ccer: 0,
             cnt: 0,
             psc: 0,
-            arr: 0xFFFF,
+            arr: 0, // RM0008 15.4.12: reset value 0x0000 (counter blocked until ARR is set)
             rcr: 0,
             ccr: [0; 4],
             psc_counter: 0,
             bdtr: 0,
             psc_active: 0,
-            arr_active: 0xFFFF,
+            arr_active: 0,
             ccr_active: [0; 4],
             oc_ref: [false; 4],
             advanced: name == "TIM1",
@@ -593,13 +593,16 @@ impl TimerState {
             0x10 => self.sr &= val | !0x1EFF, // rc_w0
             0x14 => {
                 if val & 1 != 0 {
-                    // UG: re-initialise the counter and load the shadow registers
-                    self.cnt = if self.down() { self.arr } else { 0 };
+                    // UG: re-initialise the counter and prescaler; unless UDIS is set this is
+                    // also an update event (shadow registers load, UIF unless URS)
                     self.psc_counter = 0;
-                    self.update_shadows();
-                    if self.cr1 & (1 << 2) == 0 {
-                        self.sr |= 1;
+                    if self.cr1 & (1 << 1) == 0 {
+                        self.update_shadows();
+                        if self.cr1 & (1 << 2) == 0 {
+                            self.sr |= 1;
+                        }
                     }
+                    self.cnt = if self.down() { self.arr_active } else { 0 };
                 }
                 for ch in 0..4 {
                     if val & (1 << (ch + 1)) != 0 {
@@ -667,8 +670,9 @@ impl TimerState {
     fn count_one(&mut self) {
         if self.down() {
             if self.cnt == 0 {
-                self.cnt = self.arr_active;
+                // the update event loads the ARR preload before the counter reloads from it
                 self.update_event();
+                self.cnt = self.arr_active;
             } else {
                 self.cnt -= 1;
             }
@@ -1655,38 +1659,7 @@ impl Peripherals {
             g.refresh_idr();
         }
         if !self.pin_links.is_empty() {
-            // A driven pin imposes its level on an undriven pin at the other end of the wire;
-            // several drivers on one input resolve low-dominant (wired-AND).
-            let mut imposed: Vec<(usize, u32, bool)> = Vec::new();
-            for &(pa, na, pb, nb) in &self.pin_links {
-                let (pa, na, pb, nb) = (pa as usize, na as u32, pb as usize, nb as u32);
-                if pa >= 7 || pb >= 7 || na >= 16 || nb >= 16 {
-                    continue;
-                }
-                let da = self.gpios[pa].driven_level(na);
-                let db = self.gpios[pb].driven_level(nb);
-                match (da, db) {
-                    (Some(l), None) => imposed.push((pb, nb, l)),
-                    (None, Some(l)) => imposed.push((pa, na, l)),
-                    _ => {}
-                }
-            }
-            for &(port, pin, level) in &imposed {
-                let g = &mut self.gpios[port];
-                let b = 1u16 << pin;
-                if g.link_mask & b == 0 {
-                    g.link_mask |= b;
-                    g.link_val |= b;
-                }
-                if !level {
-                    g.link_val &= !b;
-                }
-            }
-            for g in &mut self.gpios {
-                if g.link_mask != 0 {
-                    g.refresh_idr();
-                }
-            }
+            self.resolve_pin_nets();
         }
         // EXTI line x follows the pin selected by AFIO_EXTICR
         let mut lines = 0u16;
@@ -1701,6 +1674,93 @@ impl Peripherals {
         let falling = (!lines & prev) as u32 & self.exti.ftsr;
         self.exti.pr |= (rising | falling) & self.exti.imr;
         self.exti.lines = lines;
+    }
+
+    /// Resolve every group of linked pins as one wire: any low driver wins (wired-AND), then
+    /// any high driver, then pull resistors (a pull-down wins a fight with a pull-up); a
+    /// wire with nothing on it floats and each pin keeps its own level. Every pin on a
+    /// resolved wire then samples that level, including released open-drain outputs.
+    fn resolve_pin_nets(&mut self) {
+        let mut nodes: Vec<(usize, u32)> = Vec::new();
+        let mut parent: Vec<usize> = Vec::new();
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        let idx = |nodes: &mut Vec<(usize, u32)>, parent: &mut Vec<usize>, n: (usize, u32)| {
+            if let Some(i) = nodes.iter().position(|&x| x == n) {
+                i
+            } else {
+                nodes.push(n);
+                parent.push(parent.len());
+                nodes.len() - 1
+            }
+        };
+        for &(pa, na, pb, nb) in &self.pin_links {
+            let (pa, na, pb, nb) = (pa as usize, na as u32, pb as usize, nb as u32);
+            if pa >= self.gpios.len() || pb >= self.gpios.len() || na >= 16 || nb >= 16 {
+                continue;
+            }
+            let a = idx(&mut nodes, &mut parent, (pa, na));
+            let b = idx(&mut nodes, &mut parent, (pb, nb));
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            parent[ra] = rb;
+        }
+        // per net: (low driver, high driver, pull-down, pull-up)
+        let mut nets: Vec<(bool, bool, bool, bool)> = vec![(false, false, false, false); nodes.len()];
+        for (i, &(port, pin)) in nodes.iter().enumerate() {
+            let g = &self.gpios[port];
+            let b = 1u16 << pin;
+            let r = find(&mut parent, i);
+            let drive = g.driven_level(pin).or(if g.ext_mask & b != 0 { Some(g.ext_pins & b != 0) } else { None });
+            match drive {
+                Some(false) => nets[r].0 = true,
+                Some(true) => nets[r].1 = true,
+                None => {}
+            }
+            if g.pin_cfg(pin) == 0b1000 {
+                if g.odr & b as u32 != 0 {
+                    nets[r].3 = true;
+                } else {
+                    nets[r].2 = true;
+                }
+            }
+        }
+        let mut touched = [false; 7];
+        for i in 0..nodes.len() {
+            let (port, pin) = nodes[i];
+            let (lo, hi, pd, pu) = nets[find(&mut parent, i)];
+            let level = if lo {
+                Some(false)
+            } else if hi {
+                Some(true)
+            } else if pd {
+                Some(false)
+            } else if pu {
+                Some(true)
+            } else {
+                None
+            };
+            if let Some(l) = level {
+                let g = &mut self.gpios[port];
+                let b = 1u16 << pin;
+                g.link_mask |= b;
+                if l {
+                    g.link_val |= b;
+                } else {
+                    g.link_val &= !b;
+                }
+                touched[port] = true;
+            }
+        }
+        for (port, g) in self.gpios.iter_mut().enumerate() {
+            if touched.get(port).copied().unwrap_or(false) {
+                g.refresh_idr();
+            }
+        }
     }
 
     /// Drive an input pin from outside the chip (button, keypad, test harness).
@@ -1810,6 +1870,13 @@ impl Peripherals {
     /// Could an interrupt still arrive (decides whether a `B .` loop is final)?
     pub fn interrupt_armed(&self) -> bool {
         (self.systick.ctrl & 3) == 3 || self.nvic.any_irq_enabled() || self.nvic.pending.iter().any(|&p| p)
+    }
+
+    /// True while something can still change visible state without CPU help: an armed
+    /// interrupt, or a clocked timer that is counting (its output-compare pin keeps toggling).
+    pub fn activity_pending(&self) -> bool {
+        self.interrupt_armed()
+            || (0..self.timers.len()).any(|t| self.timer_clock(t) && self.timers[t].cr1 & 1 != 0)
     }
 
     // ---- debugger helpers ------------------------------------------------------------------
