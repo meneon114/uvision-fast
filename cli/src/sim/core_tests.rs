@@ -581,3 +581,44 @@ fn enabled_busfault_from_stacking_waits_behind_a_higher_priority_svc() {
     assert!(sim.mem.peripherals.nvic.pending[5], "BusFault STKERR pending");
     assert_eq!(sim.mem.read32(0xE000_ED2C) & (1 << 30), 0, "no escalation");
 }
+
+/// TIM2 update interrupt raised with the IRQ left disabled in the NVIC, then WFE.
+fn wfe_on_disabled_irq(scr: u32) -> String {
+    prog(
+        &format!(
+            "    LDR r0, =0x4002101C
+    MOVS r1, #1
+    STR r1, [r0]                ; RCC_APB1ENR: TIM2
+    LDR r0, =0x40000000
+    MOVS r1, #99
+    STR r1, [r0, #0x2C]         ; ARR
+    MOVS r1, #1
+    STR r1, [r0, #0x0C]         ; DIER.UIE (TIM2 IRQ stays disabled in the NVIC)
+    STR r1, [r0, #0x00]         ; CEN
+    LDR r0, =0xE000ED10
+    MOVS r1, #{scr}
+    STR r1, [r0]                ; SCR
+    SEV
+    WFE                         ; consumes the event register
+    WFE                         ; sleeps
+    MOVS r7, #1
+"
+        ),
+        "",
+    )
+}
+
+#[test]
+fn sevonpend_wakes_wfe_when_a_disabled_interrupt_becomes_pending() {
+    let mut sim = boot(&wfe_on_disabled_irq(0x10));
+    run_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 1);
+    assert!(sim.mem.peripherals.nvic.pending[16 + 28], "TIM2 pending, not taken");
+
+    let mut sim = boot(&wfe_on_disabled_irq(0));
+    for _ in 0..2_000 {
+        sim.cpu.step(&mut sim.mem);
+    }
+    assert!(sim.cpu.sleeping, "without SEVONPEND a disabled interrupt does not wake WFE");
+    assert_ne!(sim.cpu.r[7], 1);
+}
