@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="18" fill="#1b4965"/>
+  <rect x="10" y="10" width="108" height="108" rx="12" fill="#f0f0f0" stroke="#7ea8be" stroke-width="3"/>
+  <!-- IC Pins -->
+  <g fill="#5b7083">
+    <rect x="28" y="4" width="6" height="10"/><rect x="44" y="4" width="6" height="10"/>
+    <rect x="61" y="4" width="6" height="10"/><rect x="78" y="4" width="6" height="10"/>
+    <rect x="94" y="4" width="6" height="10"/>
+    <rect x="28" y="114" width="6" height="10"/><rect x="44" y="114" width="6" height="10"/>
+    <rect x="61" y="114" width="6" height="10"/><rect x="78" y="114" width="6" height="10"/>
+    <rect x="94" y="114" width="6" height="10"/>
+  </g>
+  <rect x="22" y="22" width="84" height="84" rx="8" fill="#173a5e"/>
+  <rect x="28" y="28" width="72" height="72" rx="4" fill="#1d4e78" stroke="#5fa8d3" stroke-width="2"/>
+  <text x="64" y="75" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-weight="700" font-size="38" fill="#ffffff">µV</text>
+  <circle cx="90" cy="38" r="7" fill="#32a852" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
