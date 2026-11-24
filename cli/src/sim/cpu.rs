@@ -61,8 +61,10 @@ pub struct Cpu {
     /// Description of the most recent fault exception.
     pub last_fault: Option<String>,
     excl: Option<u32>,
-    /// Pending exceptions seen while asleep in WFE (for SCR.SEVONPEND).
-    wfe_pending: Option<Vec<bool>>,
+    /// Asleep in WFE (an event wakes it), as opposed to WFI or sleep-on-exit.
+    wfe_sleep: bool,
+    /// Pending exceptions last seen while SCR.SEVONPEND is set.
+    sev_seen: Option<Vec<bool>>,
     cur_pc: u32,
     /// Extra cycles (exception return / tail-chain) charged to the current step.
     extra: u32,
@@ -89,7 +91,8 @@ impl Default for Cpu {
             halt_on_fault: true,
             last_fault: None,
             excl: None,
-            wfe_pending: None,
+            wfe_sleep: false,
+            sev_seen: None,
             cur_pc: 0,
             extra: 0,
         }
@@ -375,18 +378,26 @@ impl Cpu {
                 self.sleeping = false; // WFI wakes even when PRIMASK blocks the exception
             }
         }
-        if self.sleeping {
-            if let Some(seen) = &mut self.wfe_pending {
-                // SEVONPEND: an exception becoming pending is a WFE wake-up event, even when
-                // it is disabled or masked
-                let nvic = &mem.peripherals.nvic;
-                let newly = nvic.pending.iter().zip(seen.iter()).any(|(&p, &s)| p && !s);
-                seen.clone_from(&nvic.pending);
-                if newly && nvic.scr & (1 << 4) != 0 {
-                    self.sleeping = false;
-                    self.wfe_pending = None;
+        // SEVONPEND: an exception becoming pending, even a disabled or masked one, sets the
+        // event register (B1.5.18), whether or not the core is asleep yet
+        let nvic = &mem.peripherals.nvic;
+        if nvic.scr & (1 << 4) != 0 {
+            match &mut self.sev_seen {
+                Some(seen) => {
+                    if nvic.pending.iter().zip(seen.iter()).any(|(&p, &s)| p && !s) {
+                        self.event_reg = true;
+                    }
+                    seen.clone_from(&nvic.pending);
                 }
+                None => self.sev_seen = Some(nvic.pending.clone()),
             }
+        } else {
+            self.sev_seen = None;
+        }
+        if self.sleeping && self.wfe_sleep && self.event_reg {
+            self.event_reg = false;
+            self.sleeping = false;
+            self.wfe_sleep = false;
         }
         if self.sleeping {
             let n = mem.peripherals.cycles_to_next_event().unwrap_or(10_000).clamp(1, 1_000_000);
@@ -886,14 +897,14 @@ impl Cpu {
             Instr::Hint(h) => match h {
                 HintKind::Wfi => {
                     self.sleeping = true;
-                    self.wfe_pending = None;
+                    self.wfe_sleep = false;
                 }
                 HintKind::Wfe => {
                     if self.event_reg {
                         self.event_reg = false;
                     } else {
                         self.sleeping = true;
-                        self.wfe_pending = Some(mem.peripherals.nvic.pending.clone());
+                        self.wfe_sleep = true;
                     }
                 }
                 HintKind::Sev => self.event_reg = true,
@@ -1079,7 +1090,8 @@ impl Cpu {
             nvic.hfsr |= HFSR_FORCED;
             EXC_HARDFAULT
         };
-        let first = if (nvic.priority(derived), derived) < (nvic.priority(exc), exc) { derived } else { exc };
+        // only a strictly higher group priority displaces the original exception
+        let first = if nvic.group_priority(derived) < nvic.group_priority(exc) { derived } else { exc };
         let other = if first == derived { exc } else { derived };
         self.take(mem, first);
         mem.peripherals.nvic.pending[other] = true;
@@ -1108,6 +1120,7 @@ impl Cpu {
         self.excl = None;
         self.event_reg = true;
         self.sleeping = false;
+        self.wfe_sleep = false;
         match vec {
             Ok(v) => {
                 if v & 1 == 0 {
@@ -1289,6 +1302,7 @@ impl Cpu {
         }
         if kind != 0x1 && mem.peripherals.nvic.scr & 2 != 0 {
             self.sleeping = true; // SLEEPONEXIT
+            self.wfe_sleep = false;
         }
         self.extra += 10;
         Ok(())

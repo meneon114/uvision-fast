@@ -622,3 +622,85 @@ fn sevonpend_wakes_wfe_when_a_disabled_interrupt_becomes_pending() {
     assert!(sim.cpu.sleeping, "without SEVONPEND a disabled interrupt does not wake WFE");
     assert_ne!(sim.cpu.r[7], 1);
 }
+
+#[test]
+fn sevonpend_latches_an_event_that_arrives_before_wfe() {
+    let src = prog(
+        "    LDR r0, =0xE000ED10
+    MOVS r1, #0x10
+    STR r1, [r0]                ; SCR.SEVONPEND
+    SEV
+    WFE                         ; consumes the event register
+    LDR r0, =0xE000E200
+    MOVS r1, #1
+    STR r1, [r0]                ; NVIC_ISPR0: pend IRQ0, which is disabled
+    WFE                         ; the latched event: continues without sleeping
+    MOVS r7, #2
+",
+        "",
+    );
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 2);
+}
+
+#[test]
+fn equal_priority_stacking_busfault_does_not_displace_the_svc() {
+    let setup = "    LDR r0, =0xE000ED24
+    LDR r1, [r0]
+    ORR r1, r1, #(1 << 17)      ; SHCSR.BUSFAULTENA, BusFault and SVC both at priority 0
+    STR r1, [r0]
+";
+    let mut sim = boot(&stacking_fault_prog(setup));
+    run_through_faults_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 0x11, "the SVC enters first");
+    assert!(sim.mem.peripherals.nvic.pending[5], "BusFault STKERR pending");
+}
+
+#[test]
+fn step_out_of_a_handler_after_a_bl_stops_at_the_exception_return() {
+    use crate::target::DebugTarget;
+    let src = prog("    SVC #0\nback\n    MOVS r7, #5\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    PUSH {r4, lr}
+    BL helper
+after_bl
+    NOP
+    POP {r4, pc}
+    ENDP
+helper PROC
+    BX lr
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    let after_bl = sim.elf.symbol_addr("after_bl").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == after_bl).expect("inside the handler after BL");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.mem.peripherals.ipsr, 0, "back in Thread mode");
+    assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("back").unwrap());
+}
+
+#[test]
+fn step_out_reports_a_fault_on_exception_return() {
+    use crate::target::DebugTarget;
+    let src = prog("    SVC #0\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    LDR r0, =0x30000000         ; nothing is mapped here
+    MSR PSP, r0
+    LDR r0, =0xFFFFFFFD
+    BX r0
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    let svc = sim.elf.symbol_addr("SVC_Handler").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == svc).expect("SVC taken");
+    let st = sim.step_out().unwrap();
+    assert!(st.halt_reason.starts_with("Fault"), "reason {}", st.halt_reason);
+}

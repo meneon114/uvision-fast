@@ -281,18 +281,20 @@ impl DebugTarget for Simulator {
         if self.cpu.r[14] == 0xFFFF_FFFF {
             return self.step_into();
         }
-        // In a handler, LR holds EXC_RETURN: step until this exception is no longer active
-        // (a nested handler that preempts it does not count as returning).
+        // In a handler, the step also ends when the handler's exception stops being active:
+        // LR may hold EXC_RETURN, or a stale return address once a BL has come back. A nested
+        // handler that preempts this one does not count as returning.
         let handler = self.mem.peripherals.ipsr as usize;
         let exc_return = handler != 0 && self.cpu.r[14] >= 0xFFFF_FFF0;
         let mut reason = "StepOut".to_string();
         for _ in 0..50_000 {
             let hr = self.step_one_internal();
-            let returned = if exc_return {
-                !self.mem.peripherals.nvic.active[handler]
-            } else {
-                self.cpu.r[15] == ret_target
-            };
+            if !matches!(hr, HaltReason::Running) {
+                reason = format!("{:?}", hr); // e.g. a fault on the exception return
+                break;
+            }
+            let returned = (handler != 0 && !self.mem.peripherals.nvic.active[handler])
+                || (!exc_return && self.cpu.r[15] == ret_target);
             if returned {
                 break;
             }
@@ -301,10 +303,6 @@ impl DebugTarget for Simulator {
                     reason = format!("Breakpoint 0x{:08X}", self.cpu.r[15]);
                     break;
                 }
-            }
-            if !matches!(hr, HaltReason::Running) {
-                reason = format!("{:?}", hr);
-                break;
             }
         }
         Ok(self.build_state(&reason))
