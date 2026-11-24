@@ -34,6 +34,31 @@ pub struct Simulator {
 }
 
 impl Simulator {
+    /// Whether the PC lies in the callee of the call that set LR: a `BL` just before the
+    /// return address, whose target starts a region running up to the next symbol. A `BLX`
+    /// register call (unknown target) counts as containing the PC.
+    fn lr_call_contains_pc(&mut self) -> bool {
+        let ret = self.cpu.r[14] & !1;
+        let pc = self.cpu.r[15];
+        if !(4..0x4000_0000).contains(&ret) {
+            return false; // not a code address: never read peripherals for this
+        }
+        if self.mem.read16(ret.wrapping_sub(2)) & 0xFF87 == 0x4780 {
+            return true; // BLX Rm
+        }
+        let (h1, h2) = (self.mem.read16(ret.wrapping_sub(4)) as u32, self.mem.read16(ret.wrapping_sub(2)) as u32);
+        if h1 & 0xF800 != 0xF000 || h2 & 0xD000 != 0xD000 {
+            return false;
+        }
+        let s = (h1 >> 10) & 1;
+        let i1 = !((h2 >> 13) & 1 ^ s) & 1;
+        let i2 = !((h2 >> 11) & 1 ^ s) & 1;
+        let imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((h1 & 0x3FF) << 12) | ((h2 & 0x7FF) << 1);
+        let target = ret.wrapping_add(((imm << 7) as i32 >> 7) as u32);
+        let end = self.elf.symbols.iter().map(|s| s.addr).filter(|&a| a > target).min().unwrap_or(u32::MAX);
+        (target..end).contains(&pc)
+    }
+
     /// Create a simulator for the default part (STM32F103C8, Blue Pill). `xtal_hz` is the
     /// HSE crystal frequency; the core starts on the 8 MHz HSI like real silicon and runs
     /// at whatever clock the program configures through RCC.
@@ -281,18 +306,12 @@ impl DebugTarget for Simulator {
         if self.cpu.r[14] == 0xFFFF_FFFF {
             return self.step_into();
         }
-        // In a handler, the step also ends when the handler's exception stops being active:
-        // LR may hold EXC_RETURN, or a stale return address once a BL has come back. A nested
-        // handler that preempts this one does not count as returning.
+        // In a handler, the step also ends when the handler's exception stops being active (a
+        // nested handler that preempts it does not count). LR is only trusted while the PC is
+        // inside the routine that the BL before LR called; otherwise it holds EXC_RETURN or is
+        // stale from an earlier BL, and only the exception return ends the step.
         let handler = self.mem.peripherals.ipsr as usize;
-        // LR is stale when it holds EXC_RETURN or when the PC is in the handler's own body
-        // (the PROC its vector points at): only the exception return ends the step then.
-        let in_handler_body = handler != 0 && {
-            let entry = self.mem.read32(self.mem.peripherals.vtor().wrapping_add(4 * handler as u32)) & !1;
-            let pc = self.cpu.r[15];
-            self.elf.symbols.iter().any(|s| s.is_func && s.addr == entry && pc >= entry && pc < entry + s.size.max(1))
-        };
-        let exc_return = handler != 0 && (self.cpu.r[14] >= 0xFFFF_FFF0 || in_handler_body);
+        let lr_stale = handler != 0 && (self.cpu.r[14] >= 0xFFFF_FFF0 || !self.lr_call_contains_pc());
         let mut reason = "StepOut".to_string();
         for _ in 0..50_000 {
             let hr = self.step_one_internal();
@@ -301,7 +320,7 @@ impl DebugTarget for Simulator {
                 break;
             }
             let returned = (handler != 0 && !self.mem.peripherals.nvic.active[handler])
-                || (!exc_return && self.cpu.r[15] == ret_target);
+                || (!lr_stale && self.cpu.r[15] == ret_target);
             if returned {
                 break;
             }

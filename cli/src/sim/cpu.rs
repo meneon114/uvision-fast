@@ -364,6 +364,19 @@ impl Cpu {
         }
         mem.peripherals.ipsr = self.ipsr();
 
+        // SEVONPEND: an exception becoming pending, even a disabled or masked one, sets the
+        // event register (B1.5.18), whether or not the core is asleep yet.
+        // Tracked every step, before arbitration can take (and un-pend) the exception, and
+        // whatever SCR holds, so a transition during the store that sets SEVONPEND counts.
+        let nvic = &mem.peripherals.nvic;
+        if nvic.pending != self.sev_seen {
+            let newly = nvic.pending.iter().zip(self.sev_seen.iter()).any(|(&p, &s)| p && !s);
+            if newly && nvic.scr & (1 << 4) != 0 {
+                self.event_reg = true;
+            }
+            self.sev_seen.clone_from(&nvic.pending);
+        }
+
         // Exception arbitration between instructions
         if let Some((exc, prio)) = mem.peripherals.nvic.highest_pending() {
             let exec = self.execution_priority(&mem.peripherals.nvic);
@@ -377,17 +390,6 @@ impl Cpu {
             if self.sleeping && prio < self.wake_priority(&mem.peripherals.nvic) {
                 self.sleeping = false; // WFI wakes even when PRIMASK blocks the exception
             }
-        }
-        // SEVONPEND: an exception becoming pending, even a disabled or masked one, sets the
-        // event register (B1.5.18), whether or not the core is asleep yet
-        // (tracked all the time, so a transition during the store that sets SEVONPEND counts)
-        let nvic = &mem.peripherals.nvic;
-        if nvic.pending != self.sev_seen {
-            let newly = nvic.pending.iter().zip(self.sev_seen.iter()).any(|(&p, &s)| p && !s);
-            if newly && nvic.scr & (1 << 4) != 0 {
-                self.event_reg = true;
-            }
-            self.sev_seen.clone_from(&nvic.pending);
         }
         if self.sleeping && self.wfe_sleep && self.event_reg {
             self.event_reg = false;
@@ -1109,6 +1111,11 @@ impl Cpu {
         self.control &= !2;
         self.load_sp();
         let nvic = &mut mem.peripherals.nvic;
+        // an interrupt pended and taken within one step (e.g. a tail-chain) is still a
+        // SEVONPEND transition the per-step tracking never saw
+        if exc >= 16 && nvic.scr & (1 << 4) != 0 && !self.sev_seen.get(exc).copied().unwrap_or(false) {
+            self.event_reg = true;
+        }
         nvic.active[exc] = true;
         nvic.pending[exc] = false;
         mem.peripherals.ipsr = exc as u32;

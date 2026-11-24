@@ -775,3 +775,52 @@ helper PROC
     assert_eq!(sim.mem.peripherals.ipsr, 0, "left the handler, not the next loop iteration");
     assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("back").unwrap());
 }
+
+#[test]
+fn sevonpend_event_survives_an_interrupt_taken_at_once() {
+    let src = prog(
+        "    LDR r0, =0xE000ED10
+    MOVS r1, #0x10
+    STR r1, [r0]                ; SCR.SEVONPEND
+    SEV
+    WFE                         ; event register clear
+    LDR r0, =0xE000E100
+    MOVS r1, #1
+    STR r1, [r0]                ; NVIC_ISER0: IRQ0 enabled
+    STR r1, [r0, #0x100]        ; NVIC_ISPR0: pended, then taken straight away
+    WFE                         ; the pending transition was an event: continues
+    MOVS r7, #6
+",
+        "    EXPORT WWDG_IRQHandler\n",
+    )
+    .replace("    END\n", "WWDG_IRQHandler PROC\n    BX lr\n    ENDP\n    END\n");
+    let mut sim = boot(&src);
+    run_to_bkpt(&mut sim);
+    assert_eq!(sim.cpu.r[7], 6);
+}
+
+#[test]
+fn step_out_of_a_local_helper_inside_a_handler_returns_to_its_caller() {
+    use crate::target::DebugTarget;
+    let src = prog("    SVC #0\n", "    EXPORT SVC_Handler\n").replace(
+        "    END\n",
+        "SVC_Handler PROC
+    PUSH {r4, lr}
+    BL local_helper
+after_call
+    POP {r4, pc}
+local_helper
+    NOP
+    BX lr
+    ENDP
+    END
+",
+    );
+    let mut sim = boot(&src);
+    let helper = sim.elf.symbol_addr("local_helper").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == helper).expect("inside the helper");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("after_call").unwrap(), "stops at the caller, still in the handler");
+    assert_eq!(sim.mem.peripherals.ipsr, 11);
+}
