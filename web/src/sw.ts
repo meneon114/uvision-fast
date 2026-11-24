@@ -6,7 +6,9 @@ declare const self: ServiceWorkerGlobalScope & { __WB_MANIFEST: Array<{ url: str
 
 // precacheAndRoute fails the install event when any entry fails to download,
 // so a half-cached app never takes control.
-precacheAndRoute(self.__WB_MANIFEST);
+// codicon.css asks for its font as codicon-<hash>.ttf?<md5>: drop that bare md5 parameter
+// (as well as Workbox's default utm_/fbclid ones) so the font matches its precache entry offline.
+precacheAndRoute(self.__WB_MANIFEST, { ignoreURLParametersMatching: [/^utm_/, /^fbclid$/, /^[0-9a-f]{32}$/] });
 
 // Removes only this worker's outdated Workbox precaches (same scope, -precache- names).
 cleanupOutdatedCaches();
