@@ -4,7 +4,7 @@ A high-speed, zero-lag recreation of **Keil µVision 5** for **ARM Cortex-M3 / S
 
 1. **Standalone Offline WebAssembly PWA** - Runs directly in your browser and installs offline:
    - **Live URL**: [https://meneon114.github.io/uvision-fast/](https://meneon114.github.io/uvision-fast/)
-2. **Self-Contained VS Code Extension (`.vsix`)** - Classic Keil µVision 5 Light UI inside VS Code, bundling the native `uvcli.exe` engine and portable OpenOCD (download from [GitHub Releases](https://github.com/meneon114/uvision-fast/releases)).
+2. **Self-Contained VS Code Extension (`.vsix`)** - the same Keil µVision 5 style UI inside VS Code, bundling the native `uvcli.exe` engine and portable OpenOCD (download from [GitHub Releases](https://github.com/meneon114/uvision-fast/releases)).
 3. **Native Rust CLI (`uvcli`)** - Build, simulate, interactive debug (`uvcli debug`), and flash real STM32 boards (`uvcli flash`).
 
 ---
@@ -41,21 +41,33 @@ rustup target add wasm32-unknown-unknown
 cargo build --lib --target wasm32-unknown-unknown --release
 ```
 
-### 2. Standalone Offline PWA (`web/`)
+### 2. Web UI and offline PWA (`web/`)
+
+The PWA and the VS Code webview are one React app (React 19, Vite, TanStack Router, ui-sdk, CodeMirror 6) in `web/src`. Only the host differs: the PWA runs the WebAssembly core in the page, and the extension forwards the same JSON-RPC calls to `uvcli`.
 
 ```bash
 cd web
-npm install
-npm run build:wasm
-npm run gen:icons
-npm run build
-npm run preview
+npm ci
+npm run build:wasm     # builds uvision_core.wasm with cargo and copies it into public/
+npm run gen:icons      # optional: regenerates the PWA icons
+npm run build          # type-checks the app and the service worker, then builds web/dist
+npm run preview        # serves web/dist on http://localhost:4173
 ```
+
+`npm run dev` starts the Vite dev server. The service worker is only built by `npm run build`, so test offline behaviour against `npm run preview`: load the page once, then go offline and reload. The worker precaches every asset, fails its install if any entry fails to download, shows a "Reload" toast when an update is waiting, and deletes only its own caches.
 
 ### 3. VS Code Extension (`extension/`)
 
+The extension build also builds the webview, so install `web/` dependencies first.
+
 ```bash
+cd web && npm ci && cd ..
 cd extension
-npm install
-npm run build
+npm ci
+npm run build          # dev build: extension host + webview (vite build --mode vscode)
+npx @vscode/vsce package   # runs vscode:prepublish, the production build
 ```
+
+`npm run build` copies `cli/target/release/uvcli.exe` and a sibling `openocd/` into `bin/` when they exist, and only warns when they don't. The production build (`vscode:prepublish`) fails if `uvcli.exe` is missing, so a `.vsix` never ships with an empty `bin/`.
+
+The webview can call only the JSON-RPC methods listed in `web/src/host/protocol.ts` (`UI_RPC_METHODS`), and every file path it sends must be inside a workspace folder, the open project, or a file or folder the user picked in a VS Code dialog.
