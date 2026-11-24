@@ -824,3 +824,66 @@ local_helper
     assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("after_call").unwrap(), "stops at the caller, still in the handler");
     assert_eq!(sim.mem.peripherals.ipsr, 11);
 }
+
+/// `SVC #0` from Thread mode into `handler`, then `back`.
+fn step_out_case(handler: &str) -> Simulator {
+    let src = prog("    SVC #0\nback\n    MOVS r7, #5\n", "    EXPORT SVC_Handler\n")
+        .replace("    END\n", &format!("{handler}    END\n"));
+    boot(&src)
+}
+
+#[test]
+fn step_out_of_a_called_proc_with_an_internal_label_returns_to_the_handler() {
+    use crate::target::DebugTarget;
+    let mut sim = step_out_case(
+        "SVC_Handler PROC
+    PUSH {r4, lr}
+    BL delay
+after_call
+    POP {r4, pc}
+    ENDP
+delay PROC
+    MOVS r0, #3
+delay_loop
+    SUBS r0, r0, #1
+    BNE delay_loop
+dret
+    BX lr
+    ENDP
+",
+    );
+    let dret = sim.elf.symbol_addr("dret").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == dret).expect("at the end of the delay loop");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("after_call").unwrap());
+    assert_eq!(sim.mem.peripherals.ipsr, 11, "still in the handler");
+}
+
+#[test]
+fn step_out_after_an_indirect_call_in_a_handler_loop_waits_for_the_return() {
+    use crate::target::DebugTarget;
+    let mut sim = step_out_case(
+        "SVC_Handler PROC
+    PUSH {r4, lr}
+    MOVS r4, #3
+again
+    LDR r0, =helper
+    BLX r0
+after_call
+    SUBS r4, r4, #1
+    BNE again
+    POP {r4, pc}
+    ENDP
+helper PROC
+    BX lr
+    ENDP
+",
+    );
+    let after_call = sim.elf.symbol_addr("after_call").unwrap();
+    run_until(&mut sim, 100_000, |s| s.cpu.r[15] == after_call).expect("after the first indirect call");
+    let st = sim.step_out().unwrap();
+    assert_eq!(st.halt_reason, "StepOut");
+    assert_eq!(sim.mem.peripherals.ipsr, 0, "left the handler");
+    assert_eq!(sim.cpu.r[15], sim.elf.symbol_addr("back").unwrap());
+}

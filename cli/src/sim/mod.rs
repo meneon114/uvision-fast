@@ -34,9 +34,20 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    /// Whether the PC lies in the callee of the call that set LR: a `BL` just before the
-    /// return address, whose target starts a region running up to the next symbol. A `BLX`
-    /// register call (unknown target) counts as containing the PC.
+    /// Address range of the PROC (a sized function symbol) containing `addr`.
+    fn proc_range(&self, addr: u32) -> Option<std::ops::Range<u32>> {
+        self.elf
+            .symbols
+            .iter()
+            .filter(|s| s.is_func && s.size > 0)
+            .map(|s| s.addr..s.addr.saturating_add(s.size))
+            .find(|r| r.contains(&addr))
+    }
+
+    /// Whether the PC is still inside the routine called by the call that set LR.
+    /// - `BL`: its decoded target, up to the end of the PROC starting there (labels inside it
+    ///   do not end it); a bare-label target runs to the next PROC or the end of its own.
+    /// - `BLX Rm` (target unknown): anywhere outside the PROC holding the return address.
     fn lr_call_contains_pc(&mut self) -> bool {
         let ret = self.cpu.r[14] & !1;
         let pc = self.cpu.r[15];
@@ -44,7 +55,7 @@ impl Simulator {
             return false; // not a code address: never read peripherals for this
         }
         if self.mem.read16(ret.wrapping_sub(2)) & 0xFF87 == 0x4780 {
-            return true; // BLX Rm
+            return !self.proc_range(ret).is_some_and(|r| r.contains(&pc));
         }
         let (h1, h2) = (self.mem.read16(ret.wrapping_sub(4)) as u32, self.mem.read16(ret.wrapping_sub(2)) as u32);
         if h1 & 0xF800 != 0xF000 || h2 & 0xD000 != 0xD000 {
@@ -55,8 +66,16 @@ impl Simulator {
         let i2 = !((h2 >> 11) & 1 ^ s) & 1;
         let imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((h1 & 0x3FF) << 12) | ((h2 & 0x7FF) << 1);
         let target = ret.wrapping_add(((imm << 7) as i32 >> 7) as u32);
-        let end = self.elf.symbols.iter().map(|s| s.addr).filter(|&a| a > target).min().unwrap_or(u32::MAX);
-        (target..end).contains(&pc)
+        let procs = || self.elf.symbols.iter().filter(|s| s.is_func && s.size > 0);
+        let callee = match procs().find(|s| s.addr == target) {
+            Some(p) => target..target.saturating_add(p.size),
+            None => {
+                let next = procs().map(|s| s.addr).filter(|&a| a > target).min().unwrap_or(u32::MAX);
+                let own_end = self.proc_range(target).map_or(u32::MAX, |r| r.end);
+                target..next.min(own_end)
+            }
+        };
+        callee.contains(&pc)
     }
 
     /// Create a simulator for the default part (STM32F103C8, Blue Pill). `xtal_hz` is the
