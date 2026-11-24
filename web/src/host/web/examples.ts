@@ -132,8 +132,12 @@ const GPIO_UART_DEMO_S = `;;; STM32F1 RCC + GPIOA + USART1 Demo (View -> UART #1
 
 RCC_APB2ENR EQU 0x40021018
 GPIOA_CRL   EQU 0x40010800
+GPIOA_CRH   EQU 0x40010804
 GPIOA_ODR   EQU 0x4001080C
+USART1_SR   EQU 0x40013800
 USART1_DR   EQU 0x40013804
+USART1_BRR  EQU 0x40013808
+USART1_CR1  EQU 0x4001380C
 
     AREA    RESET, DATA, READONLY
     EXPORT  __Vectors
@@ -162,13 +166,33 @@ Reset_Handler
     MOV     R1, #0x0003
     STR     R1, [R0]
 
+    ; PA9 = USART1_TX: alternate-function push-pull, 50 MHz (CRH[7:4] = 0xB)
+    LDR     R0, =GPIOA_CRH
+    LDR     R1, =0x444444B4
+    STR     R1, [R0]
+
+    ; 115200 baud from the 8 MHz reset clock (HSI): 8000000 / 115200 = 69.4 -> 0x45
+    LDR     R0, =USART1_BRR
+    MOV     R1, #0x45
+    STR     R1, [R0]
+
+    ; Enable the USART (UE, bit 13) and its transmitter (TE, bit 3)
+    LDR     R0, =USART1_CR1
+    MOV     R1, #0x2008
+    STR     R1, [R0]
+
     ; Transmit banner on USART1 (check UART #1 tab)
+    LDR     R5, =USART1_SR
     LDR     R2, =USART1_DR
     ADR     R3, MSG
 TX_LOOP
     LDRB    R4, [R3], #1
     CMP     R4, #0
     BEQ     STOP
+TX_WAIT
+    LDR     R6, [R5]        ; wait for TXE (bit 7): the data register is free
+    TST     R6, #0x80
+    BEQ     TX_WAIT
     STR     R4, [R2]
     B       TX_LOOP
 
