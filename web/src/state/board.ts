@@ -59,9 +59,10 @@ export function ledLit(p: PeripheralSnapshot | null, led: BoardLed): boolean {
   return led.activeLow ? !high : high;
 }
 
-// Released buttons sit at their idle level; keypad columns idle high (pull-ups).
+// Released buttons sit at their idle level; keypad columns idle high (the module's pull-ups).
 export async function applyBoardInputs(): Promise<void> {
   driven.clear();
+  linked = null;
   const st = ide.get();
   for (const b of st.board.buttons) await drive(b.pin, b.activeLow, true);
   if (st.board.keypad) for (const c of KEYPAD_COLS) await drive(c, true, true);
@@ -74,28 +75,33 @@ export async function pressButton(id: string, down: boolean): Promise<void> {
   await drive(b.pin, down ? !b.activeLow : b.activeLow, true);
 }
 
-export async function pressKey(key: string | null): Promise<void> {
-  ide.set({ keyDown: key });
-  await syncKeypad();
+// The pressed key's switch joins its row pin to its column pin. The core models
+// the contact (debug.connectPins), so a scan loop sees it on every instruction
+// rather than only between run chunks.
+let linked: [string, string] | null = null;
+
+async function link(pair: [string, string], connected: boolean): Promise<void> {
+  try {
+    const snap = await host().rpc<PeripheralSnapshot>('debug.connectPins', { a: pair[0], b: pair[1], connected });
+    ide.set({ periph: snap });
+  } catch (e) {
+    ide.set({ status: `Keypad: ${errMsg(e)}` });
+  }
 }
 
-// Approximates the row/column contact of a 4x3 matrix: the pressed key's
-// column follows its row's output latch (low row pulls the column low).
-// A core that models the contact itself would make this unnecessary.
-export async function syncKeypad(): Promise<void> {
+function keyPins(key: string | null): [string, string] | null {
+  const idx = key ? KEYPAD_KEYS.indexOf(key as (typeof KEYPAD_KEYS)[number]) : -1;
+  return idx >= 0 ? [KEYPAD_ROWS[Math.floor(idx / 3)], KEYPAD_COLS[idx % 3]] : null;
+}
+
+export async function pressKey(key: string | null): Promise<void> {
+  ide.set({ keyDown: key });
   const st = ide.get();
-  if (!st.board.keypad || st.session !== 'on') return;
-  const idx = st.keyDown ? KEYPAD_KEYS.indexOf(st.keyDown as (typeof KEYPAD_KEYS)[number]) : -1;
-  const row = idx >= 0 ? Math.floor(idx / 3) : -1;
-  const col = idx >= 0 ? idx % 3 : -1;
-  for (let c = 0; c < KEYPAD_COLS.length; c++) {
-    let high = true;
-    if (c === col) {
-      const rowHigh = pinLevel(st.periph, KEYPAD_ROWS[row], 'odr');
-      high = rowHigh !== false;
-    }
-    await drive(KEYPAD_COLS[c], high);
-  }
+  if (st.session !== 'on') return;
+  const next = st.board.keypad ? keyPins(key) : null;
+  if (linked && linked.join() !== next?.join()) await link(linked, false);
+  if (next && linked?.join() !== next.join()) await link(next, true);
+  linked = next;
 }
 
 export function setBoard(patch: Partial<ReturnType<typeof ide.get>['board']>): void {

@@ -28,6 +28,7 @@ export const UI_RPC_METHODS = [
   'debug.command',
   'debug.peripherals',
   'debug.setGpioPin',
+  'debug.connectPins',
   'debug.uartSend',
   'debug.logicAdd',
   'debug.logicRemove',

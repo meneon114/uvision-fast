@@ -159,6 +159,9 @@ export interface GpioPort {
   lckr: number;
   ext_pins: number;
   ext_mask: number;
+  /** Pins joined to another pin (a pressed keypad switch), and the level the link drives. */
+  link_mask?: number;
+  link_val?: number;
 }
 
 export interface TimerState {

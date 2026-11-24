@@ -18,7 +18,7 @@ import { baseName, errMsg, hex32, isSourceFile, normPath, samePath } from '../li
 import { currentProjectPath, currentSearch, goProject, setSearch } from '../lib/nav';
 import type { PanelId } from '../lib/search';
 import { DEFAULT_BOARD, DEFAULT_MEM, DEFAULT_WATCH, docKey, getDoc, ide, isDirty, openDialog, type Theme } from './store';
-import { applyBoardInputs, syncKeypad } from './board';
+import { applyBoardInputs } from './board';
 
 const AUTOSAVE_MS = 350;
 const RUN_CHUNK = 20_000;
@@ -415,7 +415,6 @@ export async function run(): Promise<void> {
         lastRefresh = now;
         await applyState({ ...s, running: true }, true);
       }
-      await syncKeypad();
       // An idle loop (B .) needs no busy polling; inputs are still applied between chunks.
       await new Promise((r) => setTimeout(r, s.pc === lastPc ? 60 : 0));
       lastPc = s.pc;
@@ -477,10 +476,7 @@ function diffRegs(a: RegisterSnapshot | null, b: RegisterSnapshot, fallback: str
 export async function applyState(s: DebugState, partial = false): Promise<void> {
   const changed = diffRegs(prevRegs, s.registers, s.registers.changed_regs);
   const next: DebugState = { ...s, registers: { ...s.registers, changed_regs: changed } };
-  ide.set({
-    dbg: next,
-    status: s.running ? 'Running...' : `${s.halt_reason} | PC=${hex32(s.pc)}`,
-  });
+  ide.set({ dbg: next, status: s.running ? 'Running...' : `${s.halt_reason} | PC=${hex32(s.pc)}` });
   if (!partial && s.current_file) {
     const cur = currentSearch().file;
     if (!samePath(cur, s.current_file) || currentSearch().line !== s.current_line) {
@@ -488,7 +484,6 @@ export async function applyState(s: DebugState, partial = false): Promise<void> 
     }
   }
   await refreshViews();
-  if (!partial) await syncKeypad();
 }
 
 export async function refreshViews(): Promise<void> {

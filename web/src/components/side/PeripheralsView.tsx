@@ -206,7 +206,9 @@ function LabBoard({ p }: { p: PeripheralSnapshot | null }) {
               onKeyDown={(e: React.KeyboardEvent) => {
                 if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) void pressKey(k);
               }}
-              onKeyUp={() => void pressKey(null)}
+              onKeyUp={(e: React.KeyboardEvent) => {
+                if (e.key === ' ' || e.key === 'Enter') void pressKey(null);
+              }}
             >
               {k}
             </BaseButton>
