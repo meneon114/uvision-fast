@@ -679,8 +679,14 @@ _main PROC
     NOP
     NOP
     NOP
-    LDR r3, [r2, #0x24]         ; CNT: blocked while ARR = 0
+    LDR r3, [r2, #0x24]         ; CNT: counting towards the reset ARR
     MOVS r1, #0
+    STR r1, [r2, #0x2C]         ; ARR = 0 (no preload): the counter stops
+    LDR r5, [r2, #0x24]
+    NOP
+    NOP
+    NOP
+    LDR r6, [r2, #0x24]
     STR r1, [r2, #0x00]
     MOVS r1, #2
     STR r1, [r2, #0x00]         ; UDIS
@@ -695,12 +701,13 @@ _main PROC
 ";
 
 #[test]
-fn tim2_arr_resets_to_zero_and_ug_respects_udis() {
+fn tim2_arr_resets_to_ffff_and_ug_respects_udis() {
     let mut sim = boot_to_main(TIM2_PROBE);
     run_until(&mut sim, 10_000, |s| matches!(s.cpu.halted_reason, HaltReason::Bkpt(_)));
     let r = sim.cpu.r;
-    assert_eq!(r[0], 0, "TIMx_ARR reset value is 0x0000 (RM0008 15.4.12)");
-    assert_eq!(r[3], 0, "the counter is blocked while ARR is 0");
+    assert_eq!(r[0], 0xFFFF, "TIMx_ARR resets to 0xFFFF (RM0008 Rev 17+ 15.4.12)");
+    assert!(r[3] > 0, "CEN alone starts counting towards the reset ARR");
+    assert_eq!(r[5], r[6], "the counter is blocked while ARR is 0");
     assert_eq!(r[4] & 1, 0, "UG with UDIS set does not set UIF");
     assert_eq!(sim.mem.peripherals.timers[1].psc_active, 0, "UG with UDIS does not load the prescaler");
 }
@@ -742,4 +749,31 @@ fn linked_pins_share_one_level() {
     sim.connect_pins("PA0", "PA4", false).unwrap();
     assert_eq!(sim.mem.peripherals.gpios[PA].idr & 0x11, 0x01);
     assert!(sim.connect_pins("P\u{c9}0", "PA4", true).is_err(), "non-ASCII pin names are rejected, not a panic");
+}
+
+const PP_HIGH: &str = "
+    AREA main, CODE, READONLY
+    EXPORT _main
+    ENTRY
+_main PROC
+    LDR r2, =0x40021018         ; RCC_APB2ENR: GPIOA
+    MOVS r1, #4
+    STR r1, [r2]
+    LDR r2, =0x40010800
+    LDR r1, =0x44440002         ; PA0 push-pull output 2 MHz, PA4 floating input
+    STR r1, [r2, #0x00]
+    MOVS r1, #1
+    STR r1, [r2, #0x0C]         ; PA0 high
+    BKPT #0
+    ENDP
+    END
+";
+
+#[test]
+fn chip_output_beats_an_external_stimulus_on_a_linked_wire() {
+    let mut sim = boot_to_main(PP_HIGH);
+    run_until(&mut sim, 10_000, |s| matches!(s.cpu.halted_reason, HaltReason::Bkpt(_)));
+    sim.set_gpio_pin("GPIOA", 4, false).unwrap(); // a keypad switch left at 0 on PA4
+    sim.connect_pins("PA0", "PA4", true).unwrap();
+    assert_eq!(sim.mem.peripherals.gpios[PA].idr & 0x11, 0x11, "PA0 drives the wire high; the stimulus is weak");
 }

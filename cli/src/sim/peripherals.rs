@@ -497,13 +497,14 @@ impl TimerState {
             ccer: 0,
             cnt: 0,
             psc: 0,
-            arr: 0, // RM0008 15.4.12: reset value 0x0000 (counter blocked until ARR is set)
+            // 0xFFFF on silicon (older RM0008 revisions misprinted 0x0000; fixed in Rev 17)
+            arr: 0xFFFF,
             rcr: 0,
             ccr: [0; 4],
             psc_counter: 0,
             bdtr: 0,
             psc_active: 0,
-            arr_active: 0,
+            arr_active: 0xFFFF,
             ccr_active: [0; 4],
             oc_ref: [false; 4],
             advanced: name == "TIM1",
@@ -529,7 +530,12 @@ impl TimerState {
     }
 
     fn down(&self) -> bool {
-        self.cr1 & (1 << 4) != 0 && (self.cr1 >> 5) & 3 == 0
+        self.cr1 & (1 << 4) != 0
+    }
+
+    /// CMS != 0: center-aligned, counting up to ARR and back down to 0 (DIR is read-only).
+    fn center(&self) -> bool {
+        (self.cr1 >> 5) & 3 != 0
     }
 
     pub fn read(&self, offset: u32) -> u32 {
@@ -582,7 +588,12 @@ impl TimerState {
     pub fn write(&mut self, offset: u32, val: u32) {
         match offset {
             0x00 => {
-                self.cr1 = val & 0x3FF;
+                let dir_ro = self.center();
+                let mut v = val & 0x3FF;
+                if dir_ro {
+                    v = (v & !(1 << 4)) | (self.cr1 & (1 << 4)); // DIR is read-only in CMS modes
+                }
+                self.cr1 = v;
                 if self.cr1 & (1 << 7) == 0 {
                     self.arr_active = self.arr;
                 }
@@ -602,7 +613,12 @@ impl TimerState {
                             self.sr |= 1;
                         }
                     }
-                    self.cnt = if self.down() { self.arr_active } else { 0 };
+                    if self.center() {
+                        self.cr1 &= !(1 << 4);
+                        self.cnt = 0;
+                    } else {
+                        self.cnt = if self.down() { self.arr_active } else { 0 };
+                    }
                 }
                 for ch in 0..4 {
                     if val & (1 << (ch + 1)) != 0 {
@@ -668,6 +684,26 @@ impl TimerState {
     }
 
     fn count_one(&mut self) {
+        if self.center() {
+            // 0 .. ARR-1, overflow at ARR, ARR-1 .. 1, underflow at 0 (RM0008 15.3.2)
+            if !self.down() {
+                self.cnt += 1;
+                if self.cnt >= self.arr_active {
+                    self.cnt = self.arr_active;
+                    self.cr1 |= 1 << 4;
+                    self.update_event();
+                }
+            } else {
+                self.cnt = self.cnt.saturating_sub(1);
+                if self.cnt == 0 {
+                    self.cr1 &= !(1 << 4);
+                    self.update_event();
+                }
+            }
+            self.compare_events();
+            self.refresh_ref();
+            return;
+        }
         if self.down() {
             if self.cnt == 0 {
                 // the update event loads the ARR preload before the counter reloads from it
@@ -688,6 +724,9 @@ impl TimerState {
 
     /// Counter steps that can be skipped without reaching an update or compare event.
     fn quiet_counts(&self) -> u64 {
+        if self.center() {
+            return 0; // not used by the labs; counted one step at a time
+        }
         let down = self.down();
         let mut d: u64 = if down {
             self.cnt as u64
@@ -1709,41 +1748,28 @@ impl Peripherals {
             let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
             parent[ra] = rb;
         }
-        // per net: (low driver, high driver, pull-down, pull-up)
-        let mut nets: Vec<(bool, bool, bool, bool)> = vec![(false, false, false, false); nodes.len()];
+        // per net: chip drivers (low, high), external stimulus (low, high), internal pulls
+        // (down, up). An external stimulus is a weak source: a chip output on the wire wins.
+        let mut nets: Vec<[bool; 6]> = vec![[false; 6]; nodes.len()];
         for (i, &(port, pin)) in nodes.iter().enumerate() {
             let g = &self.gpios[port];
             let b = 1u16 << pin;
             let r = find(&mut parent, i);
-            let drive = g.driven_level(pin).or(if g.ext_mask & b != 0 { Some(g.ext_pins & b != 0) } else { None });
-            match drive {
-                Some(false) => nets[r].0 = true,
-                Some(true) => nets[r].1 = true,
+            match g.driven_level(pin) {
+                Some(level) => nets[r][level as usize] = true,
+                None if g.ext_mask & b != 0 => nets[r][2 + (g.ext_pins & b != 0) as usize] = true,
                 None => {}
             }
             if g.pin_cfg(pin) == 0b1000 {
-                if g.odr & b as u32 != 0 {
-                    nets[r].3 = true;
-                } else {
-                    nets[r].2 = true;
-                }
+                nets[r][4 + (g.odr & b as u32 != 0) as usize] = true;
             }
         }
         let mut touched = [false; 7];
         for i in 0..nodes.len() {
             let (port, pin) = nodes[i];
-            let (lo, hi, pd, pu) = nets[find(&mut parent, i)];
-            let level = if lo {
-                Some(false)
-            } else if hi {
-                Some(true)
-            } else if pd {
-                Some(false)
-            } else if pu {
-                Some(true)
-            } else {
-                None
-            };
+            let net = nets[find(&mut parent, i)];
+            // strongest tier present decides; within a tier low wins (wired-AND)
+            let level = net.chunks(2).find(|t| t[0] || t[1]).map(|t| !t[0]);
             if let Some(l) = level {
                 let g = &mut self.gpios[port];
                 let b = 1u16 << pin;
@@ -1876,7 +1902,10 @@ impl Peripherals {
     /// interrupt, or a clocked timer that is counting (its output-compare pin keeps toggling).
     pub fn activity_pending(&self) -> bool {
         self.interrupt_armed()
-            || (0..self.timers.len()).any(|t| self.timer_clock(t) && self.timers[t].cr1 & 1 != 0)
+            || (0..self.timers.len()).any(|t| {
+                let tim = &self.timers[t];
+                self.timer_clock(t) && tim.cr1 & 1 != 0 && tim.arr_active != 0
+            })
     }
 
     // ---- debugger helpers ------------------------------------------------------------------
