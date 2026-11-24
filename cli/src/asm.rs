@@ -591,8 +591,21 @@ impl Asm {
         } else if col0 {
             if w1.starts_with('.') && is_keyword(w1) {
                 // GNU directive in column 0
-            } else if is_directive(w1) && !w2.eq_ignore_ascii_case("EQU") && !w2.eq_ignore_ascii_case("RN") && !is_keyword(w2) {
-                self.diag(st.file, line, "warning", format!("Directive '{}' in column 1 is treated as a label by armasm; indent it", w1));
+            } else if is_directive(w1) && !r1.is_empty() && !is_keyword(w2) {
+                return Err(format!(
+                    "'{}' starts in column 1, so armasm reads it as a label and '{}' as an instruction. Indent directives with a space or tab",
+                    w1, w2
+                ));
+            } else if is_directive(w1) && w1 == w1.to_ascii_uppercase() && r1.is_empty() {
+                // armasm: anything in column 1 is a label, even a directive name
+                self.diag(
+                    st.file,
+                    line,
+                    "warning",
+                    format!("'{}' in column 1 defines a label named '{}', not the directive; indent it if you meant the directive", w1, w1),
+                );
+                label = Some(w1.to_string());
+                rest = r1;
             } else if encode::is_mnemonic(w1) && !r1.is_empty() && !is_keyword(w2) {
                 return Err(format!(
                     "'{}' starts in column 1, so it is read as a label and '{}' as the instruction. Indent instructions with a space or tab",
@@ -1332,7 +1345,8 @@ impl Asm {
                     Ok(v) if v.is_const() && (0..=0x0100_0000).contains(&v.v) => v.v as u32,
                     _ => 0,
                 },
-                _ => 0,
+                // data sizes are fixed when parsed; labels, alignment and pools take no size
+                _ => continue,
             };
             if need > self.stmts[s].size || (exact && need != self.stmts[s].size) {
                 self.stmts[s].size = need;
@@ -1811,4 +1825,4 @@ pub fn assemble_sources(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

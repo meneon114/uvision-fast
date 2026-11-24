@@ -182,3 +182,19 @@ fn golden_disassembly_reassembles_identically() {
         panic!("round trip differs:\n{}", msg);
     }
 }
+
+#[test]
+fn vector_table_and_data_keep_their_size() {
+    let b = build(LAB3_EXP1);
+    assert!(b.result.success, "{}", b.result.log);
+    let elf = crate::elf::LoadedElf::load_from_bytes("t.axf", b.elf_bytes.as_ref().unwrap()).unwrap();
+    let rom = &elf.segments[0];
+    assert_eq!(rom.paddr, 0x0800_0000);
+    let word = |i: usize| u32::from_le_bytes(rom.data[i * 4..i * 4 + 4].try_into().unwrap());
+    assert_eq!(word(0), 0x2000_5000, "initial SP = top of the 20 KiB SRAM");
+    let reset = elf.sym_by_name["Reset_Handler"];
+    assert_eq!(word(1), reset, "reset vector -> Reset_Handler (Thumb bit set)");
+    assert_eq!(reset & 1, 1);
+    assert_eq!(elf.entry, reset);
+    assert!(rom.data.len() >= 76 * 4 + 32);
+}
