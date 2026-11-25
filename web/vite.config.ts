@@ -1,127 +1,62 @@
-import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
-import { defineConfig, Plugin } from 'vite';
+import tailwindcss from '@tailwindcss/vite';
+import { tanstackRouter } from '@tanstack/router-plugin/vite';
+import react from '@vitejs/plugin-react';
+import { defineConfig, type PluginOption } from 'vite';
+import { VitePWA } from 'vite-plugin-pwa';
 
-function walkFiles(dir: string, baseDir = dir): string[] {
-  const out: string[] = [];
-  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, ent.name);
-    if (ent.isDirectory()) {
-      out.push(...walkFiles(full, baseDir));
-    } else {
-      const rel = path.relative(baseDir, full).replace(/\\/g, '/');
-      if (rel !== 'sw.js' && !rel.endsWith('.map')) {
-        out.push('./' + rel);
-      }
-    }
-  }
-  return out;
-}
+// One React app, two hosts. `vite build` makes the offline PWA in web/dist.
+// `vite build --mode vscode` makes the VS Code webview bundle in extension/dist/webview.
+export default defineConfig(({ mode }) => {
+  const vscode = mode === 'vscode';
 
-function uvisionPwaSwPlugin(): Plugin {
-  return {
-    name: 'uvision-pwa-sw',
-    closeBundle() {
-      const distDir = path.resolve(__dirname, 'dist');
-      if (!fs.existsSync(distDir)) return;
-      const assets = Array.from(new Set(['./', './index.html', ...walkFiles(distDir)])).sort();
-      const hash = crypto
-        .createHash('sha256')
-        .update(assets.map((a) => {
-          const p = a === './' ? path.join(distDir, 'index.html') : path.join(distDir, a.slice(2));
-          return `${a}:${fs.existsSync(p) ? fs.statSync(p).size : 0}`;
-        }).join('|'))
-        .digest('hex')
-        .slice(0, 12);
+  const plugins: PluginOption[] = [
+    tanstackRouter({ target: 'react', autoCodeSplitting: true }),
+    react(),
+    tailwindcss(),
+  ];
 
-      const swSource = `// Auto-generated offline-first Service Worker for uVision Fast PWA
-const CACHE_NAME = 'uvision-fast-pwa-${hash}';
-const PRECACHE_PATHS = ${JSON.stringify(assets, null, 2)};
-
-self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(CACHE_NAME).then(async (cache) => {
-      const scopeUrl = self.registration.scope;
-      await Promise.all(
-        PRECACHE_PATHS.map(async (rel) => {
-          const url = new URL(rel, scopeUrl).toString();
-          try {
-            const resp = await fetch(url, { cache: 'no-cache' });
-            if (resp.ok) {
-              await cache.put(url, resp);
-            }
-          } catch {
-            // Fallback to add if individual fetch needs default mode
-            await cache.add(url).catch(() => {});
-          }
-        })
-      );
-    }).then(() => self.skipWaiting())
-  );
-});
-
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
-  );
-});
-
-self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-  const reqUrl = new URL(req.url);
-  if (reqUrl.origin !== self.location.origin) return;
-
-  if (req.mode === 'navigate' || reqUrl.pathname.endsWith('/manifest.webmanifest')) {
-    event.respondWith(
-      fetch(req, { cache: 'no-cache' })
-        .then((networkResp) => {
-          if (networkResp && networkResp.ok) {
-            const copy = networkResp.clone();
-            caches.open(CACHE_NAME).then((c) => c.put(req, copy));
-          }
-          return networkResp;
-        })
-        .catch(() =>
-          caches.match(req, { ignoreSearch: true }).then((cached) => {
-            if (cached) return cached;
-            const indexUrl = new URL('./index.html', self.registration.scope).toString();
-            return caches.match(indexUrl);
-          })
-        )
+  if (!vscode) {
+    plugins.push(
+      VitePWA({
+        strategies: 'injectManifest',
+        srcDir: 'src',
+        filename: 'sw.ts',
+        registerType: 'prompt',
+        injectRegister: false,
+        manifest: false,
+        injectManifest: {
+          globPatterns: ['**/*.{html,js,css,wasm,woff,woff2,ttf,svg,png,webmanifest}'],
+          maximumFileSizeToCacheInBytes: 16 * 1024 * 1024,
+        },
+        devOptions: { enabled: false },
+      }),
     );
-    return;
   }
 
-  event.respondWith(
-    caches.match(req, { ignoreSearch: true }).then((cached) => {
-      if (cached) return cached;
-      return fetch(req).then((networkResp) => {
-        if (networkResp && networkResp.ok) {
-          const copy = networkResp.clone();
-          caches.open(CACHE_NAME).then((c) => c.put(req, copy));
+  return {
+    base: './',
+    define: {
+      __HOST__: JSON.stringify(vscode ? 'vscode' : 'web'),
+    },
+    plugins,
+    server: {
+      fs: { allow: ['..'] },
+    },
+    build: vscode
+      ? {
+          outDir: path.resolve(__dirname, '../extension/dist/webview'),
+          emptyOutDir: true,
+          manifest: true,
+          copyPublicDir: false,
+          target: 'es2022',
+          rollupOptions: {
+            input: path.resolve(__dirname, 'src/main.tsx'),
+          },
         }
-        return networkResp;
-      });
-    })
-  );
-});
-`;
-      fs.writeFileSync(path.join(distDir, 'sw.js'), swSource, 'utf8');
-      console.log(`Generated offline sw.js (${assets.length} precached assets, cache ${hash}).`);
-    },
+      : {
+          outDir: 'dist',
+          target: 'es2022',
+        },
   };
-}
-
-export default defineConfig({
-  base: './',
-  server: {
-    fs: {
-      allow: ['..'],
-    },
-  },
-  plugins: [uvisionPwaSwPlugin()],
 });

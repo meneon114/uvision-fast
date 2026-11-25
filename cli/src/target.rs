@@ -112,6 +112,11 @@ pub trait DebugTarget {
     fn disassembly(&mut self, around_addr: Option<u32>, count: usize) -> Result<Vec<DisasmLine>>;
     fn peripherals(&mut self) -> Result<Option<PeripheralSnapshot>>;
     fn set_gpio_pin(&mut self, port: &str, pin: u8, high: bool) -> Result<()>;
+    /// Connect or disconnect two pins (`"PA0"`, `"PA4"`), e.g. a held keypad key.
+    fn connect_pins(&mut self, a: &str, b: &str, connected: bool) -> Result<()> {
+        let _ = (a, b, connected);
+        Err(anyhow::anyhow!("Pin wiring is only available in the simulator"))
+    }
     fn uart_send(&mut self, text: &str) -> Result<()>;
     fn logic_add(&mut self, signal: &str) -> Result<Vec<LogicChannel>>;
     fn logic_remove(&mut self, signal: &str) -> Result<Vec<LogicChannel>>;

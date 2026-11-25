@@ -344,14 +344,11 @@ fn find_openocd(override_path: Option<&str>, keil_root: Option<&Path>) -> Option
 fn find_openocd_scripts(openocd_exe: &Path) -> Option<PathBuf> {
     let bin = openocd_exe.parent()?;
     let root = bin.parent()?;
-    for rel in [
+    [
         root.join("openocd").join("scripts"),
         root.join("share").join("openocd").join("scripts"),
         root.join("scripts"),
-    ] {
-        if rel.exists() {
-            return Some(rel);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|rel| rel.exists())
 }

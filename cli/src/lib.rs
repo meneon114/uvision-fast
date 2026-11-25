@@ -5,6 +5,7 @@ pub mod project;
 pub mod repl;
 pub mod sim;
 pub mod target;
+pub mod thumb;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod builder;

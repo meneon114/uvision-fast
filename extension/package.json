@@ -15,8 +15,10 @@
   ],
   "main": "./dist/extension.js",
   "scripts": {
-    "build": "node esbuild.mjs && tsc --noEmit",
-    "watch": "node esbuild.mjs --watch"
+    "build": "tsc --noEmit && node esbuild.mjs",
+    "build:webview": "cd ../web && npx vite build --mode vscode",
+    "watch": "node esbuild.mjs --watch",
+    "vscode:prepublish": "tsc --noEmit && node esbuild.mjs --production"
   },
   "contributes": {
     "commands": [
@@ -75,14 +77,6 @@
         }
       }
     }
-  },
-  "dependencies": {
-    "@codemirror/commands": "^6.6.0",
-    "@codemirror/language": "^6.10.2",
-    "@codemirror/search": "^6.5.6",
-    "@codemirror/state": "^6.4.1",
-    "@codemirror/view": "^6.28.6",
-    "@lezer/highlight": "^1.2.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -160,14 +160,14 @@ pub fn execute_debug_command(
             };
             let filter = parts.get(1).map(|s| s.to_ascii_uppercase());
             let mut out = Vec::new();
-            if filter.as_deref().map_or(true, |f| f == "RCC") {
+            if filter.as_deref().is_none_or(|f| f == "RCC") {
                 out.push(format!(
                     "RCC: CR=0x{:08X} CFGR=0x{:08X} APB2ENR=0x{:08X} APB1ENR=0x{:08X}",
                     p.rcc.cr, p.rcc.cfgr, p.rcc.apb2enr, p.rcc.apb1enr
                 ));
             }
             for g in &p.gpios {
-                if filter.as_deref().map_or(true, |f| g.name == f || f == "GPIO") {
+                if filter.as_deref().is_none_or(|f| g.name == f || f == "GPIO") {
                     out.push(format!(
                         "{}: CRL=0x{:08X} CRH=0x{:08X} IDR=0x{:04X} ODR=0x{:04X}",
                         g.name, g.crl, g.crh, g.idr & 0xFFFF, g.odr & 0xFFFF
@@ -175,7 +175,7 @@ pub fn execute_debug_command(
                 }
             }
             for t in &p.timers {
-                if filter.as_deref().map_or(true, |f| t.name == f || f == "TIM") {
+                if filter.as_deref().is_none_or(|f| t.name == f || f == "TIM") {
                     out.push(format!(
                         "{}: CR1=0x{:04X} SR=0x{:04X} CNT={} PSC={} ARR={}",
                         t.name, t.cr1, t.sr, t.cnt, t.psc, t.arr
@@ -218,8 +218,7 @@ pub fn resolve_bp_spec(elf: &LoadedElf, spec: &str) -> Result<(u32, Option<Strin
             return Err(anyhow::anyhow!("No instruction mapped to {}:{}", f, line));
         }
     }
-    if let Some(&addr) = elf.sym_by_name.get(spec) {
-        let clean = addr & !1;
+    if let Some(clean) = elf.symbol_addr(spec) {
         let le = elf.line_for_addr(clean);
         return Ok((clean, le.map(|l| l.file.clone()), le.map(|l| l.line)));
     }
@@ -243,20 +242,17 @@ pub fn format_step_summary(st: &DebugState) -> String {
         _ => String::new(),
     };
     format!(
-        "[{}] PC=0x{:08X}{} | Cycles={} ({:.6}s) | {}",
+        "[{}] PC=0x{:08X}{} | Cycles={} ({:.6}s) | NZCVQ={}{}{}{}{}",
         st.halt_reason,
         st.pc,
         loc,
         st.registers.cycles,
         st.registers.time_sec,
-        format!(
-            "NZCVQ={}{}{}{}{}",
-            st.registers.n as u8,
-            st.registers.z as u8,
-            st.registers.c as u8,
-            st.registers.v as u8,
-            st.registers.q as u8
-        )
+        st.registers.n as u8,
+        st.registers.z as u8,
+        st.registers.c as u8,
+        st.registers.v as u8,
+        st.registers.q as u8
     )
 }
 

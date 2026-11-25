@@ -27,3 +27,7 @@ clap = { version = "4", features = ["derive"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# The lab end-to-end tests simulate several seconds at 72 MHz; optimise the test build.
+[profile.test]
+opt-level = 2

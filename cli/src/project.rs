@@ -68,7 +68,7 @@ impl Default for TargetOptions {
     fn default() -> Self {
         Self {
             target_name: "Target 1".to_string(),
-            device: "STM32F100RB".to_string(),
+            device: "STM32F103C8".to_string(),
             pack_id: "Keil.STM32F1xx_DFP.2.4.1".to_string(),
             output_name: "firmware".to_string(),
             output_dir: "Objects".to_string(),
@@ -151,9 +151,7 @@ impl UvProject {
             _ => 5,
         };
 
-        let mut options = TargetOptions::default();
-        options.output_name = stem;
-        options.output_dir = "Objects".to_string();
+        let options = TargetOptions { output_name: stem, output_dir: "Objects".to_string(), ..Default::default() };
 
         Self {
             project_file: None,
@@ -202,9 +200,7 @@ impl UvProject {
             _ => 5,
         };
 
-        let mut options = TargetOptions::default();
-        options.output_name = stem;
-        options.output_dir = ".uvcli_build".to_string();
+        let options = TargetOptions { output_name: stem, output_dir: ".uvcli_build".to_string(), ..Default::default() };
 
         Ok(Self {
             project_file: None,
@@ -250,13 +246,11 @@ impl UvProject {
         if files.is_empty() {
             return Err(anyhow!("No .uvprojx, .s, or .c files found in {}", abs_dir.display()));
         }
-        let mut options = TargetOptions::default();
-        options.output_name = abs_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("firmware")
-            .to_string();
-        options.output_dir = ".uvcli_build".to_string();
+        let options = TargetOptions {
+            output_name: abs_dir.file_name().and_then(|s| s.to_str()).unwrap_or("firmware").to_string(),
+            output_dir: ".uvcli_build".to_string(),
+            ..Default::default()
+        };
 
         Ok(Self {
             project_file: None,
@@ -305,8 +299,7 @@ impl UvProject {
             .unwrap_or("firmware")
             .to_string();
 
-        let mut options = TargetOptions::default();
-        options.output_name = stem;
+        let mut options = TargetOptions { output_name: stem, ..Default::default() };
 
         let mut groups: Vec<ProjectGroup> = Vec::new();
         let mut stack: Vec<String> = Vec::new();
@@ -508,9 +501,7 @@ impl UvProject {
         let src_abs = format!("{}/{}", root_dir, src_name);
         let proj_abs = format!("{}/{}.uvprojx", root_dir, name);
 
-        let mut options = TargetOptions::default();
-        options.device = device.to_string();
-        options.output_name = name.to_string();
+        let options = TargetOptions { device: device.to_string(), output_name: name.to_string(), ..Default::default() };
 
         let proj = Self {
             project_file: Some(proj_abs.clone()),
@@ -537,7 +528,7 @@ impl UvProject {
         file_path: &str,
         create_template: Option<&str>,
         exists: bool,
-    ) -> Result<(ProjectFile, Option<String>, Option<(String, String)>)> {
+    ) -> Result<VirtualFileAdded> {
         let abs = resolve_virtual_path(&self.root_dir, file_path);
         let ext = abs
             .rsplit_once('.')
@@ -628,9 +619,7 @@ impl UvProject {
         }
 
         let proj_path = dir.join(format!("{}.uvprojx", name));
-        let mut options = TargetOptions::default();
-        options.device = device.to_string();
-        options.output_name = name.to_string();
+        let options = TargetOptions { device: device.to_string(), output_name: name.to_string(), ..Default::default() };
 
         let proj = Self {
             project_file: Some(proj_path.to_string_lossy().into_owned()),
@@ -955,6 +944,10 @@ fn is_virtual_abs(p: &str) -> bool {
     let s = p.replace('\\', "/");
     s.starts_with('/') || (s.len() >= 2 && s.as_bytes()[1] == b':')
 }
+
+/// Result of [`ProjectSpec::add_virtual_file`]: the file entry, the created template body
+/// (if any) and a replaced `(old, new)` path pair (if any).
+pub type VirtualFileAdded = (ProjectFile, Option<String>, Option<(String, String)>);
 
 pub fn resolve_virtual_path(root: &str, rel: &str) -> String {
     let r_clean = norm_slashes(rel);

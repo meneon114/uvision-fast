@@ -77,7 +77,7 @@ impl ServerState {
                     .get("device")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or("STM32F100RB");
+                    .unwrap_or("STM32F103C8");
                 let template = params
                     .get("template")
                     .and_then(|v| v.as_str())
@@ -209,7 +209,8 @@ impl ServerState {
                         .map(|x| x as u32)
                         .or_else(|| self.project.as_ref().map(|p| p.options.xtal_hz))
                         .unwrap_or(8_000_000);
-                    Box::new(Simulator::new(elf.clone(), clk))
+                    let device = self.project.as_ref().map(|p| p.options.device.clone()).unwrap_or_else(|| "STM32F103C8".into());
+                    Box::new(Simulator::new_for_device(elf.clone(), clk, &device))
                 };
 
                 // Apply initial breakpoints if passed
@@ -405,6 +406,15 @@ impl ServerState {
                 let pin = params.get("pin").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let high = params.get("high").and_then(|v| v.as_bool()).unwrap_or(false);
                 self.req_target()?.set_gpio_pin(&port, pin, high)?;
+                let snap = self.req_target()?.peripherals()?;
+                Ok(serde_json::to_value(snap)?)
+            }
+
+            "debug.connectPins" => {
+                let a = req_str(&params, "a")?;
+                let b = req_str(&params, "b")?;
+                let connected = params.get("connected").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.req_target()?.connect_pins(&a, &b, connected)?;
                 let snap = self.req_target()?.peripherals()?;
                 Ok(serde_json::to_value(snap)?)
             }

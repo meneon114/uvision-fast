@@ -1,10 +1,16 @@
 pub mod cpu;
 pub mod memory;
+pub mod nvic;
 pub mod peripherals;
+
+#[cfg(test)]
+mod core_tests;
+#[cfg(test)]
+mod lab_tests;
 
 use crate::elf::{DisasmLine, LoadedElf};
 use crate::sim::cpu::{is_thumb32, Cpu, HaltReason};
-use crate::sim::memory::Memory;
+use crate::sim::memory::{DeviceMap, Memory};
 use crate::sim::peripherals::{LogicAnalyzer, LogicChannel, PeripheralSnapshot};
 use crate::target::{
     BreakpointInfo, CallFrame, DebugState, DebugTarget, MemoryReadResult, RegisterSnapshot,
@@ -28,10 +34,61 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    pub fn new(elf: LoadedElf, clock_hz: u32) -> Self {
+    /// Address range of the PROC (a sized function symbol) containing `addr`.
+    fn proc_range(&self, addr: u32) -> Option<std::ops::Range<u32>> {
+        self.elf
+            .symbols
+            .iter()
+            .filter(|s| s.is_func && s.size > 0)
+            .map(|s| s.addr..s.addr.saturating_add(s.size))
+            .find(|r| r.contains(&addr))
+    }
+
+    /// Whether the PC is still inside the routine called by the call that set LR.
+    /// - `BL`: its decoded target, up to the end of the PROC starting there (labels inside it
+    ///   do not end it); a bare-label target runs to the next PROC or the end of its own.
+    /// - `BLX Rm` (target unknown): anywhere outside the PROC holding the return address.
+    fn lr_call_contains_pc(&mut self) -> bool {
+        let ret = self.cpu.r[14] & !1;
+        let pc = self.cpu.r[15];
+        if !(4..0x4000_0000).contains(&ret) {
+            return false; // not a code address: never read peripherals for this
+        }
+        if self.mem.read16(ret.wrapping_sub(2)) & 0xFF87 == 0x4780 {
+            return !self.proc_range(ret).is_some_and(|r| r.contains(&pc));
+        }
+        let (h1, h2) = (self.mem.read16(ret.wrapping_sub(4)) as u32, self.mem.read16(ret.wrapping_sub(2)) as u32);
+        if h1 & 0xF800 != 0xF000 || h2 & 0xD000 != 0xD000 {
+            return false;
+        }
+        let s = (h1 >> 10) & 1;
+        let i1 = !((h2 >> 13) & 1 ^ s) & 1;
+        let i2 = !((h2 >> 11) & 1 ^ s) & 1;
+        let imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((h1 & 0x3FF) << 12) | ((h2 & 0x7FF) << 1);
+        let target = ret.wrapping_add(((imm << 7) as i32 >> 7) as u32);
+        let procs = || self.elf.symbols.iter().filter(|s| s.is_func && s.size > 0);
+        let callee = match procs().find(|s| s.addr == target) {
+            Some(p) => target..target.saturating_add(p.size),
+            None => {
+                let next = procs().map(|s| s.addr).filter(|&a| a > target).min().unwrap_or(u32::MAX);
+                let own_end = self.proc_range(target).map_or(u32::MAX, |r| r.end);
+                target..next.min(own_end)
+            }
+        };
+        callee.contains(&pc)
+    }
+
+    /// Create a simulator for the default part (STM32F103C8, Blue Pill). `xtal_hz` is the
+    /// HSE crystal frequency; the core starts on the 8 MHz HSI like real silicon and runs
+    /// at whatever clock the program configures through RCC.
+    pub fn new(elf: LoadedElf, xtal_hz: u32) -> Self {
+        Self::new_for_device(elf, xtal_hz, "STM32F103C8")
+    }
+
+    /// Create a simulator whose flash/SRAM sizes follow the given ST part number.
+    pub fn new_for_device(elf: LoadedElf, xtal_hz: u32, device: &str) -> Self {
         let mut cpu = Cpu::default();
-        cpu.clock_hz = clock_hz.max(1);
-        let mut mem = Memory::default();
+        let mut mem = Memory::new(DeviceMap::for_device(device), xtal_hz.max(1));
         mem.reset_and_load(&elf);
         cpu.reset(&mut mem, Some(elf.entry));
 
@@ -128,7 +185,7 @@ impl Simulator {
             primask: self.cpu.primask,
             control: self.cpu.control,
             cycles: self.cpu.cycles,
-            time_sec: (self.cpu.cycles as f64) / (self.cpu.clock_hz as f64),
+            time_sec: self.cpu.time_sec,
             changed_regs: changed,
             n: self.cpu.flag_n(),
             z: self.cpu.flag_z(),
@@ -268,10 +325,22 @@ impl DebugTarget for Simulator {
         if self.cpu.r[14] == 0xFFFF_FFFF {
             return self.step_into();
         }
+        // In a handler, the step also ends when the handler's exception stops being active (a
+        // nested handler that preempts it does not count). LR is only trusted while the PC is
+        // inside the routine that the BL before LR called; otherwise it holds EXC_RETURN or is
+        // stale from an earlier BL, and only the exception return ends the step.
+        let handler = self.mem.peripherals.ipsr as usize;
+        let lr_stale = handler != 0 && (self.cpu.r[14] >= 0xFFFF_FFF0 || !self.lr_call_contains_pc());
         let mut reason = "StepOut".to_string();
         for _ in 0..50_000 {
             let hr = self.step_one_internal();
-            if self.cpu.r[15] == ret_target {
+            if !matches!(hr, HaltReason::Running) {
+                reason = format!("{:?}", hr); // e.g. a fault on the exception return
+                break;
+            }
+            let returned = (handler != 0 && !self.mem.peripherals.nvic.active[handler])
+                || (!lr_stale && self.cpu.r[15] == ret_target);
+            if returned {
                 break;
             }
             if let Some(bp) = self.breakpoints.get(&self.cpu.r[15]) {
@@ -279,10 +348,6 @@ impl DebugTarget for Simulator {
                     reason = format!("Breakpoint 0x{:08X}", self.cpu.r[15]);
                     break;
                 }
-            }
-            if !matches!(hr, HaltReason::Running) {
-                reason = format!("{:?}", hr);
-                break;
             }
         }
         Ok(self.build_state(&reason))
@@ -319,8 +384,19 @@ impl DebugTarget for Simulator {
                 _ => {}
             }
 
+            if self.cpu.sleeping && !self.mem.peripherals.activity_pending() {
+                reason = format!("Sleep 0x{:08X} (WFI/WFE with no interrupt source armed)", self.cpu.r[15]);
+                break;
+            }
+
             let after_pc = self.cpu.r[15];
-            if stop_on_self_loop && after_pc == cur_pc && prev_pc == cur_pc {
+            // A branch-to-self only ends the run when nothing (SysTick, EXTI, a counting
+            // timer driving an output-compare pin, UART) can still change what happens.
+            if stop_on_self_loop
+                && after_pc == cur_pc
+                && prev_pc == cur_pc
+                && !self.mem.peripherals.activity_pending()
+            {
                 same_pc_streak += 1;
                 if same_pc_streak >= 2 {
                     reason = format!("SelfLoop 0x{:08X}", after_pc);
@@ -416,8 +492,22 @@ impl DebugTarget for Simulator {
     }
 
     fn write_memory(&mut self, addr: u32, data: &[u8]) -> Result<()> {
-        for (i, &b) in data.iter().enumerate() {
-            self.mem.write8(addr.wrapping_add(i as u32), b);
+        // Use the widest aligned access, as a debugger does: peripheral registers replicate
+        // narrow writes across the word, so byte-by-byte writes would clobber them.
+        let mut i = 0usize;
+        while i < data.len() {
+            let a = addr.wrapping_add(i as u32);
+            let left = data.len() - i;
+            if a.is_multiple_of(4) && left >= 4 {
+                self.mem.write32(a, u32::from_le_bytes(data[i..i + 4].try_into().unwrap()));
+                i += 4;
+            } else if a.is_multiple_of(2) && left >= 2 {
+                self.mem.write16(a, u16::from_le_bytes([data[i], data[i + 1]]));
+                i += 2;
+            } else {
+                self.mem.write8(a, data[i]);
+                i += 1;
+            }
         }
         Ok(())
     }
@@ -500,8 +590,7 @@ impl DebugTarget for Simulator {
                 kind: "memory32".to_string(),
             });
         }
-        if let Some(&addr) = self.elf.sym_by_name.get(trimmed) {
-            let clean = addr & !1;
+        if let Some(clean) = self.elf.symbol_addr(trimmed) {
             let v = self.mem.read32(clean);
             return Ok(WatchEval {
                 expr: trimmed.to_string(),
@@ -523,13 +612,24 @@ impl DebugTarget for Simulator {
 
     fn set_gpio_pin(&mut self, port: &str, pin: u8, high: bool) -> Result<()> {
         let p = port.trim().to_ascii_uppercase();
-        if let Some(g) = self.mem.peripherals.gpios.iter_mut().find(|g| g.name == p) {
-            g.set_ext_pin(pin, high);
+        if let Some(idx) = self.mem.peripherals.gpios.iter().position(|g| g.name == p) {
+            if pin > 15 {
+                return Err(anyhow!("Pin {} out of range (0-15)", pin));
+            }
+            self.mem.peripherals.set_input_pin(idx, pin, high);
             self.record_logic_points();
             Ok(())
         } else {
             Err(anyhow!("Unknown GPIO port '{}'", port))
         }
+    }
+
+    fn connect_pins(&mut self, a: &str, b: &str, connected: bool) -> Result<()> {
+        let pa = parse_pin_name(a).ok_or_else(|| anyhow!("Bad pin name '{}' (expected e.g. PA0)", a))?;
+        let pb = parse_pin_name(b).ok_or_else(|| anyhow!("Bad pin name '{}' (expected e.g. PA4)", b))?;
+        self.mem.peripherals.set_pin_link(pa, pb, connected);
+        self.record_logic_points();
+        Ok(())
     }
 
     fn uart_send(&mut self, text: &str) -> Result<()> {
@@ -551,6 +651,22 @@ impl DebugTarget for Simulator {
     fn logic_samples(&mut self) -> Result<Vec<LogicChannel>> {
         Ok(self.logic.channels.clone())
     }
+}
+
+/// `"PA0"`, `"pc15"`, `"GPIOB.3"` -> (port index, pin).
+pub fn parse_pin_name(s: &str) -> Option<(u8, u8)> {
+    let u = s.trim().to_ascii_uppercase();
+    let rest = u.strip_prefix("GPIO").or_else(|| u.strip_prefix('P'))?;
+    // split by characters, not bytes, so non-ASCII input is rejected instead of panicking
+    let mut chars = rest.chars();
+    let port = chars.next()?;
+    let tail = chars.as_str();
+    let pin = tail.strip_prefix('.').unwrap_or(tail);
+    if !('A'..='G').contains(&port) {
+        return None;
+    }
+    let pin: u8 = pin.parse().ok()?;
+    (pin < 16).then_some((port as u8 - b'A', pin))
 }
 
 pub fn parse_reg_name(upper: &str) -> Option<usize> {
@@ -654,11 +770,12 @@ mod tests {
         mem.write32(0x4001_0810, 1 << 16);
         assert_eq!(mem.read32(0x4001_080C) & 1, 0);
 
-        // External pin input on PA1
-        mem.peripherals.gpios[0].set_ext_pin(1, true);
+        // External pin input on PA1 (floating input by reset configuration)
+        mem.peripherals.set_input_pin(0, 1, true);
         assert_eq!(mem.read32(0x4001_0808) & 2, 2);
 
-        // Timer 2 ticks
+        // Timer 2 ticks (clock enabled in RCC_APB1ENR)
+        mem.write32(0x4002_101C, 1);
         mem.write32(0x4000_0028, 0); // PSC = 0
         mem.write32(0x4000_002C, 5); // ARR = 5
         mem.write32(0x4000_0000, 1); // CEN = 1

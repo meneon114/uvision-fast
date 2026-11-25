@@ -218,8 +218,8 @@ impl HardwareTarget {
         let primask = self.read_reg_idx(19).unwrap_or(0) & 1;
 
         let mut changed = Vec::new();
-        for i in 0..16 {
-            if r[i] != self.prev_r[i] {
+        for (i, (&now, &before)) in r.iter().zip(self.prev_r.iter()).enumerate().take(16) {
+            if now != before {
                 changed.push(reg_label(i).to_string());
             }
         }

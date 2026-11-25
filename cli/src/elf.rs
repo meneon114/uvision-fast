@@ -15,6 +15,9 @@ use std::process::Command;
 #[derive(Debug, Clone)]
 pub struct ElfSegment {
     pub vaddr: u32,
+    /// Load (physical) address: where the bytes live in the image. Equal to `vaddr`
+    /// except for initialised RW data, which runs from SRAM but is stored in flash.
+    pub paddr: u32,
     pub memsz: u32,
     pub data: Vec<u8>,
 }
@@ -53,6 +56,39 @@ pub struct LoadedElf {
     pub sym_by_name: HashMap<String, u32>,
     pub lines: Vec<LineEntry>,
     pub disassembly: Vec<DisasmLine>,
+    /// ELF mapping symbols (`$t` code / `$d` data), sorted by address.
+    pub mapping: Vec<(u32, bool)>,
+}
+
+impl LoadedElf {
+    /// Address of a symbol with the Thumb bit removed from code symbols only. A global
+    /// definition wins over a file-local label of the same name.
+    pub fn symbol_addr(&self, name: &str) -> Option<u32> {
+        let raw = *self.sym_by_name.get(name)?;
+        self.symbols
+            .iter()
+            .find(|s| s.name == name && (s.addr == raw || (s.is_func && s.addr == raw & !1)))
+            .map(|s| s.addr)
+    }
+}
+
+/// (p_vaddr, p_paddr) of each PT_LOAD program header of a little-endian ELF32 file.
+fn program_header_paddrs(b: &[u8]) -> Vec<(u32, u32)> {
+    let rd16 = |o: usize| b.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
+    let rd32 = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+    if b.len() < 52 || &b[..4] != b"\x7fELF" || b[4] != 1 || b[5] != 1 {
+        return Vec::new();
+    }
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (rd32(28), rd16(42), rd16(44)) else {
+        return Vec::new();
+    };
+    (0..phnum)
+        .filter_map(|i| {
+            let o = phoff as usize + i * phentsize;
+            (rd32(o)? == 1).then_some(())?;
+            Some((rd32(o + 8)?, rd32(o + 12)?))
+        })
+        .collect()
 }
 
 impl LoadedElf {
@@ -68,6 +104,7 @@ impl LoadedElf {
                 &parsed.lines,
                 &parsed.symbols,
                 parsed.entry,
+            &parsed.mapping,
             );
         }
         parsed.disassembly = disassembly;
@@ -81,6 +118,7 @@ impl LoadedElf {
             &parsed.lines,
             &parsed.symbols,
             parsed.entry,
+            &parsed.mapping,
         );
         Ok(parsed)
     }
@@ -90,28 +128,52 @@ impl LoadedElf {
             .map_err(|e| anyhow!("Invalid ELF/AXF {}: {}", label, e))?;
 
         let entry = obj.entry() as u32;
+        let paddrs = program_header_paddrs(bytes);
         let mut segments = Vec::new();
         for seg in obj.segments() {
             let vaddr = seg.address() as u32;
             let memsz = seg.size() as u32;
             let data = seg.data().map(|d| d.to_vec()).unwrap_or_default();
             if memsz > 0 {
-                segments.push(ElfSegment { vaddr, memsz, data });
+                let paddr = paddrs.iter().find(|(v, _)| *v == vaddr).map(|(_, p)| *p).unwrap_or(vaddr);
+                segments.push(ElfSegment { vaddr, paddr, memsz, data });
             }
         }
 
         let mut symbols = Vec::new();
         let mut sym_by_name = HashMap::new();
+        let mut global_names = std::collections::HashSet::new();
+        let mut mapping = Vec::new();
         for sym in obj.symbols() {
             let Ok(name) = sym.name() else { continue };
+            if name == "$t" || name.starts_with("$t.") || name == "$d" || name.starts_with("$d.") {
+                mapping.push((sym.address() as u32 & !1, name.starts_with("$t")));
+                continue;
+            }
             if name.is_empty() || name.starts_with('$') {
                 continue;
             }
             let raw_addr = sym.address() as u32;
-            let addr = raw_addr & !1;
-            let is_func = sym.kind() == SymbolKind::Text || (raw_addr & 1) == 1;
+            // Bit 0 is the Thumb bit only on code symbols; a data label (STT_OBJECT) can sit
+            // at an odd address, e.g. a DCB right after another DCB.
+            let in_code = sym
+                .section_index()
+                .and_then(|i| obj.section_by_index(i).ok())
+                .is_some_and(|s| s.kind() == object::SectionKind::Text);
+            let is_func = match sym.kind() {
+                SymbolKind::Text => true,
+                SymbolKind::Data => false,
+                _ => in_code && raw_addr & 1 == 1,
+            };
+            let addr = if is_func { raw_addr & !1 } else { raw_addr };
             let size = sym.size() as u32;
-            sym_by_name.entry(name.to_string()).or_insert(raw_addr);
+            if sym.is_global() {
+                if global_names.insert(name.to_string()) {
+                    sym_by_name.insert(name.to_string(), raw_addr);
+                }
+            } else if !global_names.contains(name) {
+                sym_by_name.entry(name.to_string()).or_insert(raw_addr);
+            }
             symbols.push(ElfSymbol {
                 name: name.to_string(),
                 addr,
@@ -120,6 +182,8 @@ impl LoadedElf {
             });
         }
         symbols.sort_by_key(|s| (s.addr, s.name.clone()));
+        mapping.sort();
+        mapping.dedup_by_key(|m| m.0);
 
         let lines = extract_dwarf_lines(&obj).unwrap_or_default();
 
@@ -131,6 +195,7 @@ impl LoadedElf {
             sym_by_name,
             lines,
             disassembly: Vec::new(),
+            mapping,
         })
     }
 
@@ -193,11 +258,10 @@ impl LoadedElf {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&enorm);
-            if (enorm == qnorm || ename == qname) && e.line >= line && e.line - line <= 8 {
-                if best.map_or(true, |(bl, _)| e.line < bl) {
+            if (enorm == qnorm || ename == qname) && e.line >= line && e.line - line <= 8
+                && best.is_none_or(|(bl, _)| e.line < bl) {
                     best = Some((e.line, e.addr));
                 }
-            }
         }
         best.map(|(_, a)| a)
     }
@@ -206,11 +270,10 @@ impl LoadedElf {
         let clean = addr & !1;
         let mut best: Option<&ElfSymbol> = None;
         for s in &self.symbols {
-            if s.addr <= clean && s.addr >= 0x0800_0000 {
-                if best.map_or(true, |b| s.addr >= b.addr) {
+            if s.addr <= clean && s.addr >= 0x0800_0000
+                && best.is_none_or(|b| s.addr >= b.addr) {
                     best = Some(s);
                 }
-            }
         }
         best.map(|s| (s, clean - s.addr))
     }
@@ -378,6 +441,7 @@ fn extract_disassembly(
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn line_lookup(lines: &[LineEntry], addr: u32) -> Option<&LineEntry> {
     let idx = lines.partition_point(|e| e.addr <= addr);
     if idx == 0 {
